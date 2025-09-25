@@ -32,44 +32,44 @@ workflows:
 
       - name: Import distribution P12 and fetch profiles
         script: |
-          # Ensure the secure vars exist
+          set -euo pipefail
+
+          # 0) Sanity
           if [ -z "${DISTRIBUTION_P12_BASE64:-}" ] || [ -z "${DISTRIBUTION_P12_PASSWORD:-}" ]; then
-            echo "ERROR: DISTRIBUTION_P12_BASE64 or DISTRIBUTION_P12_PASSWORD is not set"; exit 2
+            echo "DISTRIBUTION_P12_* env vars are not set"; exit 2
           fi
 
-          # Materialize the base64 .p12 to disk (single-line Python avoids YAML indentation pitfalls)
+          # 1) Materialize the base64 P12 to disk
+          CERT_DIR="$HOME/Library/MobileDevice/Certificates"
+          mkdir -p "$CERT_DIR"
           python3 - <<'PY'
           import os, base64, pathlib
-          b = os.environ["DISTRIBUTION_P12_BASE64"].strip().encode()
-          p = pathlib.Path(os.environ["HOME"]) / "Library/MobileDevice/Certificates" / "env_cert.p12"
-          p.parent.mkdir(parents=True, exist_ok=True)
-          p.write_bytes(base64.b64decode(b))
-          print(p)
+          b64 = os.environ['DISTRIBUTION_P12_BASE64'].strip()
+          p   = pathlib.Path.home()/'Library/MobileDevice/Certificates'/'env_cert.p12'
+          p.write_bytes(base64.b64decode(b64.encode()))
           PY
 
-          CERT_DIR="$HOME/Library/MobileDevice/Certificates"
-          echo "$CERT_DIR/env_cert.p12"
-
-          # Create keychain and import the P12 with its password
+          # 2) Initialize keychain & import the P12 with password
           keychain initialize
           keychain add-certificates \
             --certificate "$CERT_DIR/env_cert.p12" \
             --certificate-pass "$DISTRIBUTION_P12_PASSWORD"
 
-          # Fetch/create provisioning profiles (positional bundle id for CLI 0.60.x)
-          app-store-connect fetch-signing-files "$BUNDLE_ID" \
-            --type IOS_APP_STORE \
-            --create
+          # 3) Fetch (or create) the App Store profile for your bundle id
+          app-store-connect fetch-signing-files "$BUNDLE_ID" --type IOS_APP_STORE --create
 
-          # Apply profiles to the project (no --scheme on this CLI)
-          xcode-project use-profiles \
-            --project "$XCODE_PROJECT"
+          # Show what we got (useful for debugging)
+          ls -al "$HOME/Library/MobileDevice/Provisioning Profiles" || true
+
+          # 4) Apply those profiles to the project (workspace first, then project fallback)
+          xcode-project use-profiles --workspace "$XCODE_WORKSPACE" --scheme "$XCODE_SCHEME" \
+          || xcode-project use-profiles --project ios/Runner.xcodeproj
 
       - name: Build IPA
         script: |
-          xcode-project build-ipa \
-            --workspace "$XCODE_WORKSPACE" \
-            --scheme "$XCODE_SCHEME"
+          set -euo pipefail
+          xcode-project build-ipa --workspace "$XCODE_WORKSPACE" --scheme "$XCODE_SCHEME" \
+          || xcode-project build-ipa --project ios/Runner.xcodeproj --scheme "$XCODE_SCHEME"
 
       - name: Publish to TestFlight
         script: |
@@ -80,3 +80,4 @@ workflows:
 
     artifacts:
       - build/ios/ipa/*.ipa
+
