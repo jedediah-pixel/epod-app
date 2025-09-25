@@ -1,0 +1,48 @@
+{
+  "project_info": {
+    "project_number": "58907211901",
+    "project_id": "hm-pod",
+    "storage_bucket": "hm-pod.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:58907211901:android:3058b55b82cf4248c85914",
+        "android_client_info": {
+          "package_name": "com.example.barcode_uploader"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAOs0OhI-bZr3tK_M41ezCSHnOgj2TNYqY"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:58907211901:android:3e06d38955586aaec85914",
+        "android_client_info": {
+          "package_name": "com.hm.epod"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAOs0OhI-bZr3tK_M41ezCSHnOgj2TNYqY"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
