@@ -8,19 +8,12 @@ workflows:
       xcode: latest
       vars:
         BUNDLE_ID: com.yourco.hmepod
-        XCODE_SCHEME: Runner
-        XCODE_PROJECT: ios/Runner.xcodeproj
         XCODE_WORKSPACE: ios/Runner.xcworkspace
+        XCODE_SCHEME: Runner
       groups:
-        - app_store_credentials   # APP_STORE_CONNECT_* + APPLE_TEAM_ID
+        - app_store_credentials   # optional: if you stored the Apple vars in a group
 
     scripts:
-      - name: Print tool versions
-        script: |
-          echo "codemagic-cli-tools: $(codemagic-cli-tools version)"
-          app-store-connect --version || true
-          xcode-project --version || true
-
       - name: Flutter pub get
         script: flutter pub get
 
@@ -34,52 +27,32 @@ workflows:
         script: |
           set -e
 
-          # 0) Sanity checks for env vars
-          if [ -z "${DISTRIBUTION_P12_BASE64:-}" ] || [ -z "${DISTRIBUTION_P12_PASSWORD:-}" ]; then
-            echo "❌ DISTRIBUTION_P12_BASE64 or DISTRIBUTION_P12_PASSWORD is missing"
-            exit 2
-          fi
-
-          # 1) Write the P12 to disk
+          # Write the P12 from base64
           CERT_DIR="$HOME/Library/MobileDevice/Certificates"
           mkdir -p "$CERT_DIR"
-          CERT_PATH="$CERT_DIR/env_cert.p12"
-          echo "$DISTRIBUTION_P12_BASE64" | base64 --decode > "$CERT_PATH"
-          echo "$CERT_PATH"
+          echo "$DISTRIBUTION_P12_BASE64" | base64 --decode > "$CERT_DIR/env_cert.p12"
+          echo "$CERT_DIR/env_cert.p12"
+          ls -l "$CERT_DIR/env_cert.p12"
 
-          # 2) Quick password check (fails fast if wrong)
-          openssl pkcs12 -in "$CERT_PATH" -nokeys -clcerts -passin pass:"$DISTRIBUTION_P12_PASSWORD" -info >/dev/null
-
-          # 3) Create & select a clean keychain
+          # Create & unlock a dedicated keychain
           keychain initialize
-          # Find the default keychain path Codemagic just created
-          KEYCHAIN_PATH=$(security default-keychain -d user | awk -F\" '{print $2}')
-          echo "Using keychain: $KEYCHAIN_PATH"
+          KEYCHAIN_PATH="$HOME/Library/codemagic-cli-tools/keychains/codemagic.keychain-db"
 
-          # 4) Import the P12 into that keychain WITH the password
-          security import "$CERT_PATH" \
-            -k "$KEYCHAIN_PATH" \
-            -P "$DISTRIBUTION_P12_PASSWORD" \
-            -T /usr/bin/codesign -T /usr/bin/security -A
+          # Import the P12 with the password
+          security import "$CERT_DIR/env_cert.p12" -k "$KEYCHAIN_PATH" -P "$DISTRIBUTION_P12_PASSWORD" -A -T /usr/bin/codesign
 
-          # 5) Make sure codesign tools can use the key (sometimes needed)
-          security set-key-partition-list -S apple-tool:,apple: -s -k "" "$KEYCHAIN_PATH" || true
+          # Fetch/create the App Store profile for your bundle id (positional arg!)
+          app-store-connect fetch-signing-files "$BUNDLE_ID" --type IOS_APP_STORE --create
 
-          # 6) Fetch/create APP STORE provisioning profiles for your bundle id
-          # (Note: bundle id is a positional arg for this CLI)
-          app-store-connect fetch-signing-files "com.yourco.hmepod" --type IOS_APP_STORE --create
+          # Apply the profiles to the project (your CLI expects --project, not --workspace)
+          xcode-project use-profiles --project ios/Runner.xcodeproj --scheme "$XCODE_SCHEME"
 
-          # 7) Apply the profiles to the Xcode project (your CLI supports --project)
-          xcode-project use-profiles --project ios/Runner.xcodeproj --scheme "Runner"
-
-          # 8) Debug listings
-          ls -al "$HOME/Library/MobileDevice/Certificates" || true
-          ls -al "$HOME/Library/MobileDevice/Provisioning Profiles" || true
-          security find-identity -v -p codesigning || true
-
+          # Sanity check
+          ls -l "$HOME/Library/MobileDevice/Provisioning Profiles" || true
 
       - name: Build IPA
         script: |
+          # Build & export IPA. Do not pass --export-method; let the tool detect from the profile.
           xcode-project build-ipa \
             --workspace "$XCODE_WORKSPACE" \
             --scheme "$XCODE_SCHEME"
@@ -93,4 +66,3 @@ workflows:
 
     artifacts:
       - build/ios/ipa/*.ipa
-
