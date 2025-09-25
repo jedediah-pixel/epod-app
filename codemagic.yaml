@@ -12,6 +12,7 @@ workflows:
         XCODE_SCHEME: Runner
       groups:
         - app_store_credentials   # holds APP_STORE_CONNECT_* and APPLE_TEAM_ID
+        - ios_distribution_cert 
         # Add these two as *Secure* env vars in Codemagic UI (do NOT put in repo):
         # - DISTRIBUTION_P12_BASE64
         # - DISTRIBUTION_P12_PASSWORD
