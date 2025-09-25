@@ -112,11 +112,13 @@ workflows:
     - name: Apply profiles to Xcode project (and show settings)
       script: |
         set -e
-        xcode-project use-profiles --project ios/Runner.xcodeproj --scheme "$XCODE_SCHEME"
-        echo "---- Xcode build settings (key signing vars) AFTER use-profiles ----"
+        # This subcommand only supports --project in your CLI version
+        xcode-project use-profiles --project ios/Runner.xcodeproj
+
+        echo "---- Xcode build settings AFTER use-profiles ----"
         xcodebuild -workspace "$XCODE_WORKSPACE" -scheme "$XCODE_SCHEME" -showBuildSettings | \
-        egrep "PRODUCT_BUNDLE_IDENTIFIER|DEVELOPMENT_TEAM|CODE_SIGN_STYLE|PROVISIONING_PROFILE_SPECIFIER|CODE_SIGNING_ALLOWED" || true
-        echo "--------------------------------------------------------------------"
+          egrep "PRODUCT_BUNDLE_IDENTIFIER|DEVELOPMENT_TEAM|CODE_SIGN_STYLE|PROVISIONING_PROFILE_SPECIFIER|CODE_SIGNING_ALLOWED" || true
+        echo "-------------------------------------------------"
 
     - name: Build archive (verbose failure if codesign missing)
       script: |
