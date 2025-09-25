@@ -18,140 +18,136 @@ workflows:
         # - DISTRIBUTION_P12_PASSWORD
 
     scripts:
-      - name: Print non-secret env summary
-        script: |
-          set -euo pipefail
-          echo "BUNDLE_ID=$BUNDLE_ID"
-          echo "XCODE_WORKSPACE=$XCODE_WORKSPACE"
-          echo "XCODE_SCHEME=$XCODE_SCHEME"
-          # Redacted presence checks
-          for v in APP_STORE_CONNECT_ISSUER_ID APP_STORE_CONNECT_KEY_IDENTIFIER APP_STORE_CONNECT_PRIVATE_KEY APPLE_TEAM_ID DISTRIBUTION_P12_BASE64 DISTRIBUTION_P12_PASSWORD; do
-            if [ -z "${!v:-}" ]; then echo "❌ MISSING env var: $v"; missing=1; else echo "✅ $v present"; fi
-          done
-          if [ "${missing:-0}" = "1" ]; then echo "Stopping: required env vars are missing"; exit 2; fi
+    - name: Print non-secret env summary
+      script: |
+        set -euo pipefail
+        echo "BUNDLE_ID=$BUNDLE_ID"
+        echo "XCODE_WORKSPACE=$XCODE_WORKSPACE"
+        echo "XCODE_SCHEME=$XCODE_SCHEME"
+        # Only check Apple API key vars + the P12 Base64 (password is hardcoded)
+        for v in APP_STORE_CONNECT_ISSUER_ID APP_STORE_CONNECT_KEY_IDENTIFIER APP_STORE_CONNECT_PRIVATE_KEY APPLE_TEAM_ID DISTRIBUTION_P12_BASE64; do
+          if [ -z "${!v:-}" ]; then echo "❌ MISSING env var: $v"; missing=1; else echo "✅ $v present"; fi
+        done
+        if [ "${missing:-0}" = "1" ]; then echo "Stopping: required env vars are missing"; exit 2; fi
 
-      - name: Flutter pub get
-        script: flutter pub get
+    - name: Flutter pub get
+      script: flutter pub get
 
-      - name: CocoaPods install (with logs)
-        script: |
-          set -e
-          cd ios
-          pod install --repo-update
-          cd ..
-          echo "Pods installed. If you see the xcconfig warning, it's OK for CI."
+    - name: CocoaPods install (with logs)
+      script: |
+        set -e
+        cd ios
+        pod install --repo-update
+        cd ..
+        echo "Pods installed. If you see the xcconfig warning, it's OK for CI."
 
-      - name: Show Xcode signing fields (before applying profiles)
-        script: |
-          set -e
-          echo "---- Xcode build settings (key signing vars) BEFORE use-profiles ----"
-          xcodebuild -workspace "$XCODE_WORKSPACE" -scheme "$XCODE_SCHEME" -showBuildSettings | \
-          egrep "PRODUCT_BUNDLE_IDENTIFIER|DEVELOPMENT_TEAM|CODE_SIGN_STYLE|PROVISIONING_PROFILE_SPECIFIER|CODE_SIGNING_ALLOWED" || true
-          echo "---------------------------------------------------------------------"
+    - name: Show Xcode signing fields (before applying profiles)
+      script: |
+        set -e
+        echo "---- Xcode build settings (key signing vars) BEFORE use-profiles ----"
+        xcodebuild -workspace "$XCODE_WORKSPACE" -scheme "$XCODE_SCHEME" -showBuildSettings | \
+        egrep "PRODUCT_BUNDLE_IDENTIFIER|DEVELOPMENT_TEAM|CODE_SIGN_STYLE|PROVISIONING_PROFILE_SPECIFIER|CODE_SIGNING_ALLOWED" || true
+        echo "---------------------------------------------------------------------"
 
-      - name: Decode P12 and sanity check (size, hash, password)
-        script: |
-          set -euo pipefail
+    - name: Decode P12 and sanity check (size, hash, password)  # password hardcoded here
+      script: |
+        set -euo pipefail
 
-          CERT_DIR="$HOME/Library/MobileDevice/Certificates"
-          CERT_PATH="$CERT_DIR/env_cert.p12"
-          mkdir -p "$CERT_DIR"
+        CERT_DIR="$HOME/Library/MobileDevice/Certificates"
+        CERT_PATH="$CERT_DIR/env_cert.p12"
+        mkdir -p "$CERT_DIR"
 
-          # 1) Check inputs
-          if [ -z "${DISTRIBUTION_P12_BASE64:-}" ]; then
-            echo "ERROR: DISTRIBUTION_P12_BASE64 is empty"
-            exit 2
-          fi
-          echo "Length(DISTRIBUTION_P12_BASE64)=${#DISTRIBUTION_P12_BASE64}"
+        if [ -z "${DISTRIBUTION_P12_BASE64:-}" ]; then
+          echo "ERROR: DISTRIBUTION_P12_BASE64 is empty"; exit 2
+        fi
+        echo "Length(DISTRIBUTION_P12_BASE64)=${#DISTRIBUTION_P12_BASE64}"
 
-          # 2) Decode base64 to file (support macOS and GNU base64)
-          DECODE_FLAG="-D"
-          if base64 --help 2>&1 | grep -q -- '--decode'; then
-            DECODE_FLAG="--decode"
-          fi
-          echo "$DISTRIBUTION_P12_BASE64" | base64 $DECODE_FLAG > "$CERT_PATH"
+        # Decode base64 to file (supports BSD/GNU base64)
+        if base64 --help 2>&1 | grep -q -- '--decode'; then DFLAG="--decode"; else DFLAG="-D"; fi
+        echo "$DISTRIBUTION_P12_BASE64" | base64 $DFLAG > "$CERT_PATH"
 
-          # 3) File checks
-          ls -l "$CERT_PATH" || true
-          echo "SHA256 of env_cert.p12:"
-          shasum -a 256 "$CERT_PATH"
+        ls -l "$CERT_PATH" || true
+        echo "SHA256 of env_cert.p12:"; shasum -a 256 "$CERT_PATH" || true
 
-          # 4) Password check (no secrets printed)
-          P12PASS="${DISTRIBUTION_P12_PASSWORD:-}"
-          if [ -z "$P12PASS" ]; then
-            echo "ERROR: DISTRIBUTION_P12_PASSWORD is empty"
-            exit 3
-          fi
+        P12PASS='HMEios2025'
+        echo "Checking P12 password (no secrets printed)…"
+        if ! /usr/bin/openssl pkcs12 -info -in "$CERT_PATH" -passin pass:"$P12PASS" -nokeys >/dev/null 2>&1; then
+          echo "ERROR: Wrong hardcoded P12 password or corrupted P12"; exit 6
+        fi
+        # stash pass for next step without echoing it
+        printf "%s" "$P12PASS" > "$CERT_DIR/.p12pass"
 
-          echo "Checking P12 password (no secrets printed)…"
-          if ! openssl pkcs12 -info -in "$CERT_PATH" -passin pass:"$P12PASS" -nokeys >/dev/null 2>&1; then
-            echo "ERROR: Wrong P12 password or corrupted P12"
-            exit 6
-          fi
+    - name: Import certificate into keychain (hardcoded password)
+      script: |
+        set -euo pipefail
+        CERT_DIR="$HOME/Library/MobileDevice/Certificates"
+        CERT_PATH="$CERT_DIR/env_cert.p12"
+        P12PASS="$(cat "$CERT_DIR/.p12pass")"
 
-          echo "OK: P12 password works"
+        keychain initialize
 
+        # Try helper first with explicit password
+        if ! keychain add-certificates --certificate-password "$P12PASS"; then
+          echo "Helper failed, trying manual import…"
+          ACTIVE_KC="$(security list-keychains -d user | tail -n1 | tr -d ' "')"
+          security import "$CERT_PATH" \
+            -k "$ACTIVE_KC" \
+            -P "$P12PASS" \
+            -A \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+        fi
 
-      - name: Import certificate into keychain
-        script: |
-          set -e
-          keychain initialize
-          keychain add-certificates  # imports all P12s from default folder using DISTRIBUTION_P12_PASSWORD
-          echo "List code signing identities after import:"
+        echo "List code signing identities after import:"
+        security find-identity -v -p codesigning || true
+
+    - name: Fetch provisioning profiles (create if missing)
+      script: |
+        set -e
+        echo "Fetching/creating IOS_APP_STORE profiles for $BUNDLE_ID …"
+        app-store-connect fetch-signing-files "$BUNDLE_ID" --type IOS_APP_STORE --create
+        echo "Downloaded Provisioning Profiles:"
+        ls -l "$HOME/Library/MobileDevice/Provisioning Profiles" || true
+
+    - name: Apply profiles to Xcode project (and show settings)
+      script: |
+        set -e
+        xcode-project use-profiles --project ios/Runner.xcodeproj --scheme "$XCODE_SCHEME"
+        echo "---- Xcode build settings (key signing vars) AFTER use-profiles ----"
+        xcodebuild -workspace "$XCODE_WORKSPACE" -scheme "$XCODE_SCHEME" -showBuildSettings | \
+        egrep "PRODUCT_BUNDLE_IDENTIFIER|DEVELOPMENT_TEAM|CODE_SIGN_STYLE|PROVISIONING_PROFILE_SPECIFIER|CODE_SIGNING_ALLOWED" || true
+        echo "--------------------------------------------------------------------"
+
+    - name: Build archive (verbose failure if codesign missing)
+      script: |
+        set -e
+        set -o pipefail
+        xcodebuild -workspace "$XCODE_WORKSPACE" \
+                  -scheme "$XCODE_SCHEME" \
+                  -configuration Release \
+                  -archivePath build/ios/xcarchive/Runner.xcarchive \
+                  archive \
+                  CODE_SIGN_STYLE=Manual \
+                  COMPILER_INDEX_STORE_ENABLE=NO | xcpretty || {
+          echo "❌ xcodebuild archive failed. Dumping identities and profiles:"
           security find-identity -v -p codesigning || true
-
-      - name: Fetch provisioning profiles (create if missing)
-        script: |
-          set -e
-          echo "Fetching/creating IOS_APP_STORE profiles for $BUNDLE_ID …"
-          # Positional bundle-id to avoid older CLI flag mismatch
-          app-store-connect fetch-signing-files "$BUNDLE_ID" --type IOS_APP_STORE --create
-
-          echo "Downloaded Provisioning Profiles:"
           ls -l "$HOME/Library/MobileDevice/Provisioning Profiles" || true
+          exit 1
+        }
 
-          echo "Profiles matching bundle id:"
-          grep -i "$BUNDLE_ID" -R "$HOME/Library/MobileDevice/Provisioning Profiles" || echo "No visible match in filenames (OK if UUID-named)."
+    - name: Export IPA
+      script: |
+        set -e
+        xcode-project build-ipa --workspace "$XCODE_WORKSPACE" --scheme "$XCODE_SCHEME"
 
-      - name: Apply profiles to Xcode project (and show settings)
-        script: |
-          set -e
-          xcode-project use-profiles --project ios/Runner.xcodeproj
+    - name: Publish to TestFlight
+      script: |
+        set -e
+        app-store-connect publish \
+          --path "build/ios/ipa/*.ipa" \
+          --submit-to-testflight true \
+          --release-type MANUAL
 
-          echo "---- Xcode build settings (key signing vars) AFTER use-profiles ----"
-          xcodebuild -workspace "$XCODE_WORKSPACE" -scheme "$XCODE_SCHEME" -showBuildSettings | \
-          egrep "PRODUCT_BUNDLE_IDENTIFIER|DEVELOPMENT_TEAM|CODE_SIGN_STYLE|PROVISIONING_PROFILE_SPECIFIER|CODE_SIGNING_ALLOWED" || true
-          echo "--------------------------------------------------------------------"
-
-      - name: Build archive (verbose failure if codesign missing)
-        script: |
-          set -e
-          set -o pipefail
-          xcodebuild -workspace "$XCODE_WORKSPACE" \
-                     -scheme "$XCODE_SCHEME" \
-                     -configuration Release \
-                     -archivePath build/ios/xcarchive/Runner.xcarchive \
-                     archive \
-                     CODE_SIGN_STYLE=Manual \
-                     COMPILER_INDEX_STORE_ENABLE=NO | xcpretty || {
-            echo "❌ xcodebuild archive failed. Dumping recent signing identities and profiles for debugging:"
-            security find-identity -v -p codesigning || true
-            ls -l "$HOME/Library/MobileDevice/Provisioning Profiles" || true
-            exit 1
-          }
-
-      - name: Export IPA
-        script: |
-          set -e
-          xcode-project build-ipa --workspace "$XCODE_WORKSPACE" --scheme "$XCODE_SCHEME"
-
-      - name: Publish to TestFlight
-        script: |
-          set -e
-          app-store-connect publish \
-            --path "build/ios/ipa/*.ipa" \
-            --submit-to-testflight true \
-            --release-type MANUAL
 
     artifacts:
       - build/ios/ipa/*.ipa
