@@ -51,43 +51,46 @@ workflows:
 
       - name: Decode P12 and sanity check (size, hash, password)
         script: |
-          set -eo pipefail
+          set -euo pipefail
 
           CERT_DIR="$HOME/Library/MobileDevice/Certificates"
           CERT_PATH="$CERT_DIR/env_cert.p12"
           mkdir -p "$CERT_DIR"
 
-          # 1) Ensure base64 is present and decode to a file
+          # 1) Check inputs
           if [ -z "${DISTRIBUTION_P12_BASE64:-}" ]; then
             echo "ERROR: DISTRIBUTION_P12_BASE64 is empty"
             exit 2
           fi
+          echo "Length(DISTRIBUTION_P12_BASE64)=${#DISTRIBUTION_P12_BASE64}"
 
-          python3 - "$CERT_PATH" <<'PY'
-      import os, sys, base64, pathlib
-      out_path = pathlib.Path(sys.argv[1])
-      b64 = (os.environ.get("DISTRIBUTION_P12_BASE64") or "").strip()
-      print(f"Length(DISTRIBUTION_P12_BASE64)={len(b64)}")
-      out_path.parent.mkdir(parents=True, exist_ok=True)
-      out_path.write_bytes(base64.b64decode(b64))
-      print(str(out_path))
-      PY
+          # 2) Decode base64 to file (support macOS and GNU base64)
+          DECODE_FLAG="-D"
+          if base64 --help 2>&1 | grep -q -- '--decode'; then
+            DECODE_FLAG="--decode"
+          fi
+          echo "$DISTRIBUTION_P12_BASE64" | base64 $DECODE_FLAG > "$CERT_PATH"
 
+          # 3) File checks
           ls -l "$CERT_PATH" || true
           echo "SHA256 of env_cert.p12:"
           shasum -a 256 "$CERT_PATH"
 
-          # 2) TEMP: hardcode password for debugging (remove after confirming)
-          P12PASS='HMEios2025'
-          export P12PASS
+          # 4) Password check (no secrets printed)
+          P12PASS="${DISTRIBUTION_P12_PASSWORD:-}"
+          if [ -z "$P12PASS" ]; then
+            echo "ERROR: DISTRIBUTION_P12_PASSWORD is empty"
+            exit 3
+          fi
 
-          echo "Checking P12 password (no secrets printed)..."
-          if ! openssl pkcs12 -info -in "$CERT_PATH" -passin env:P12PASS -nokeys >/dev/null 2>&1; then
-            echo "ERROR: Wrong password for P12 or file is corrupted"
+          echo "Checking P12 password (no secrets printed)…"
+          if ! openssl pkcs12 -info -in "$CERT_PATH" -passin pass:"$P12PASS" -nokeys >/dev/null 2>&1; then
+            echo "ERROR: Wrong P12 password or corrupted P12"
             exit 6
           fi
 
           echo "OK: P12 password works"
+
 
       - name: Import certificate into keychain
         script: |
