@@ -1,22 +1,21 @@
 # ios/Podfile
 
-platform :ios, '13.0'
+platform :ios, '14.0'
 ENV['COCOAPODS_DISABLE_STATS'] = 'true'
 
-# Find FLUTTER_ROOT from the generated xcconfig.
+# Read FLUTTER_ROOT from Generated.xcconfig
 generated = File.expand_path(File.join('..', 'Flutter', 'Generated.xcconfig'), __FILE__)
-unless File.exist?(generated)
-  raise "Generated.xcconfig must exist. Run `flutter pub get` and try again. (Missing: #{generated})"
-end
+raise "Run `flutter pub get` to create #{generated}" unless File.exist?(generated)
 
 flutter_root = nil
 File.foreach(generated) do |line|
-  match = line.match(/FLUTTER_ROOT=(.*)/)
-  flutter_root = match[1].strip if match
+  if (m = line.match(/FLUTTER_ROOT=(.*)/))
+    flutter_root = m[1].strip
+    break
+  end
 end
 raise "FLUTTER_ROOT not found in #{generated}" unless flutter_root
 
-# Load the pod helper from the Flutter SDK (reliable in CI)
 require File.expand_path(File.join('packages', 'flutter_tools', 'bin', 'podhelper'), flutter_root)
 
 flutter_ios_podfile_setup
@@ -26,13 +25,11 @@ target 'Runner' do
 end
 
 post_install do |installer|
-  # Apply Flutter’s recommended build settings.
   flutter_additional_ios_build_settings(installer)
-
-  # Ensure iOS 13.0 across all configs
-  installer.pods_project.targets.each do |target|
-    target.build_configurations.each do |config|
-      config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '13.0'
+  # Force iOS 14.0 on every target/config so pods like workmanager_apple resolve
+  installer.pods_project.targets.each do |t|
+    t.build_configurations.each do |c|
+      c.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '14.0'
     end
   end
 end
