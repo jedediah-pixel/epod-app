@@ -6,12 +6,12 @@ workflows:
     environment:
       flutter: stable
       xcode: latest
-      vars:                        # <-- moved here
+      vars:
         BUNDLE_ID: com.yourco.hmepod
         XCODE_WORKSPACE: ios/Runner.xcworkspace
         XCODE_SCHEME: Runner
-      groups:                      # <-- moved here
-        - app_store_credentials    # (the env group you created with the 4 Apple vars)
+      groups:
+        - app_store_credentials   # contains: APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_KEY_IDENTIFIER, APP_STORE_CONNECT_PRIVATE_KEY, APPLE_TEAM_ID
 
     scripts:
       - name: Flutter pub get
@@ -25,32 +25,20 @@ workflows:
           pod install
           cd ..
 
-      - name: Fetch signing files
+      - name: Fetch signing files & apply
         script: |
-          app-store-connect fetch-signing-files "$BUNDLE_ID" \
-            --type IOS_APP_STORE \
-            --create
+          app-store-connect fetch-signing-files "$BUNDLE_ID" --type IOS_APP_STORE --create
           keychain initialize
           keychain add-certificates
           xcode-project use-profiles --workspace "$XCODE_WORKSPACE" --scheme "$XCODE_SCHEME"
 
-      - name: Build archive
+      # Single step: archive + export IPA
+      - name: Build & Export IPA
         script: |
-          rm -rf build/ios/xcarchive
-          xcodebuild -workspace "$XCODE_WORKSPACE" \
-                     -scheme "$XCODE_SCHEME" \
-                     -configuration Release \
-                     -archivePath build/ios/xcarchive/Runner.xcarchive \
-                     archive \
-                     CODE_SIGN_STYLE=Manual \
-                     COMPILER_INDEX_STORE_ENABLE=NO
-
-      - name: Export IPA
-        script: |
-          xcode-project export-ipa \
-            --archive build/ios/xcarchive/Runner.xcarchive \
-            --export-method app-store \
-            --output build/ios/ipa
+          xcode-project build-ipa \
+            --workspace "$XCODE_WORKSPACE" \
+            --scheme "$XCODE_SCHEME" \
+            --export-method app-store
 
       - name: Publish to TestFlight
         script: |
@@ -60,4 +48,3 @@ workflows:
             --release-type MANUAL
 
     artifacts:
-      - build/ios/ipa/*.ipa
