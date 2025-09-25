@@ -1,45 +1,63 @@
 workflows:
   ios_testflight:
     name: iOS → TestFlight (Flutter)
+    max_build_duration: 60
     environment:
       flutter: stable
       xcode: latest
-      groups:
-        - app_store_credentials
-      vars:
-        BUNDLE_ID: com.yourco.hmepod
-        XCODE_WORKSPACE: ios/Runner.xcworkspace
-        XCODE_SCHEME: Runner
+    vars:
+      BUNDLE_ID: com.yourco.hmepod
+      XCODE_WORKSPACE: ios/Runner.xcworkspace
+      XCODE_SCHEME: Runner
+    groups:
+      - app_store_credentials
+
     scripts:
       - name: Flutter pub get
         script: flutter pub get
+
       - name: CocoaPods clean & install
         script: |
           cd ios
-          rm -rf Pods Podfile.lock
+          rm -f Podfile.lock
           pod repo update
-          pod install --repo-update
+          pod install
           cd ..
-      - name: Set up automatic code signing (App Store)
+
+      # ⬇️ Fetch & install certs/profiles, then apply them to the Xcode project
+      - name: Fetch signing files
         script: |
-          keychain initialize
           app-store-connect fetch-signing-files "$BUNDLE_ID" \
             --type IOS_APP_STORE \
-            --team-id $APPLE_TEAM_ID \
             --create
+          keychain initialize
           keychain add-certificates
-          xcode-project use-profiles
-      - name: Show signing settings
+          xcode-project use-profiles --workspace "$XCODE_WORKSPACE" --scheme "$XCODE_SCHEME"
+
+      - name: Build archive
         script: |
-          xcode-project show-build-settings \
-            --workspace "$XCODE_WORKSPACE" \
-            --scheme "$XCODE_SCHEME" \
-          | egrep "PRODUCT_BUNDLE_IDENTIFIER|DEVELOPMENT_TEAM|PROVISIONING_PROFILE_SPECIFIER|CODE_SIGN_STYLE"
-      - name: Build IPA with Xcode (App Store archive)
+          rm -rf build/ios/xcarchive
+          xcodebuild -workspace "$XCODE_WORKSPACE" \
+                     -scheme "$XCODE_SCHEME" \
+                     -configuration Release \
+                     -archivePath build/ios/xcarchive/Runner.xcarchive \
+                     archive \
+                     CODE_SIGN_STYLE=Manual \
+                     COMPILER_INDEX_STORE_ENABLE=NO
+
+      - name: Export IPA
         script: |
-          xcode-project build-ipa \
-            --workspace "$XCODE_WORKSPACE" \
-            --scheme "$XCODE_SCHEME"
+          xcode-project export-ipa \
+            --archive build/ios/xcarchive/Runner.xcarchive \
+            --export-method app-store \
+            --output build/ios/ipa
+
+      - name: Publish to TestFlight
+        script: |
+          app-store-connect publish \
+            --path "build/ios/ipa/*.ipa" \
+            --submit-to-testflight true \
+            --release-type MANUAL
+
     artifacts:
       - build/ios/ipa/*.ipa
-      - build/**/dSYMs/**
