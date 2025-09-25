@@ -142,13 +142,15 @@ workflows:
         set -e
         xcode-project build-ipa --workspace "$XCODE_WORKSPACE" --scheme "$XCODE_SCHEME"
 
-    - name: Publish to TestFlight
+    - name: Show publish help (debug)
+      script: app-store-connect publish --help
+
+
+    - name: Upload IPA to App Store Connect
       script: |
         set -e
-        app-store-connect publish \
-          --path "build/ios/ipa/*.ipa" \
-          --submit-to-testflight \
-          --release-type MANUAL
+        app-store-connect publish --path "build/ios/ipa/*.ipa"
+
 
     artifacts:
       - build/ios/ipa/*.ipa
