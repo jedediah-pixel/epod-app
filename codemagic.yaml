@@ -2,7 +2,6 @@ workflows:
   ios_testflight:
     name: iOS → TestFlight (Flutter)
     max_build_duration: 60
-
     environment:
       flutter: stable
       xcode: latest
@@ -11,46 +10,42 @@ workflows:
         XCODE_WORKSPACE: ios/Runner.xcworkspace
         XCODE_SCHEME: Runner
       groups:
-        - app_store_credentials   # contains: APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_KEY_IDENTIFIER, APP_STORE_CONNECT_PRIVATE_KEY, APPLE_TEAM_ID
+        - app_store_credentials   # contains APP_STORE_CONNECT_* vars
 
     scripts:
       - name: Flutter pub get
         script: flutter pub get
 
-      - name: CocoaPods clean & install
+      - name: CocoaPods install
         script: |
           cd ios
-          rm -f Podfile.lock
-          pod repo update
-          pod install
+          pod install --repo-update
           cd ..
 
-      - name: (one-time) Create Apple Distribution cert if missing
+      - name: Fetch & install signing (automatic)
         script: |
-          if [ -z "${CERTIFICATE_PRIVATE_KEY:-}" ]; then
-            echo "No CERTIFICATE_PRIVATE_KEY set; creating a new Apple Distribution certificate..."
-            app-store-connect certificates create --type IOS_DISTRIBUTION --save-private-key CERTIFICATE_PRIVATE_KEY
-            echo "----- COPY EVERYTHING BELOW into a Secure env var named CERTIFICATE_PRIVATE_KEY -----"
-            echo "$CERTIFICATE_PRIVATE_KEY"
-            echo "----- END COPY -----"
-          else
-            echo "CERTIFICATE_PRIVATE_KEY already present; skipping cert creation."
-          fi
-
-      - name: Fetch signing files & apply
-        script: |
-          app-store-connect fetch-signing-files "$BUNDLE_ID" --type IOS_APP_STORE --create
+          app-store-connect fetch-signing-files \
+            --type IOS_APP_STORE \
+            --bundle-id "$BUNDLE_ID" \
+            --create
+          ls -al "$HOME/Library/MobileDevice/Certificates" || true
+          ls -al "$HOME/Library/MobileDevice/Provisioning Profiles" || true
           keychain initialize
-          keychain add-certificates
-          xcode-project use-profiles --project ios/Runner.xcodeproj --scheme "$XCODE_SCHEME"
+          keychain add-certificates || true
+          CERT_DIR="$HOME/Library/MobileDevice/Certificates"
+          if [ -z "$(ls -1 "$CERT_DIR"/*.p12 2>/dev/null)" ]; then
+            echo "ERROR: No .p12 certificates were created/fetched. Check API key role/team/quota."
+            exit 2
+          fi
+          xcode-project use-profiles \
+            --workspace "$XCODE_WORKSPACE" \
+            --scheme "$XCODE_SCHEME"
 
-      # Single step: archive + export IPA
-      - name: Build & Export IPA
+      - name: Build IPA
         script: |
           xcode-project build-ipa \
             --workspace "$XCODE_WORKSPACE" \
-            --scheme "$XCODE_SCHEME" \
-            --export-method app-store
+            --scheme "$XCODE_SCHEME"
 
       - name: Publish to TestFlight
         script: |
@@ -59,7 +54,5 @@ workflows:
             --submit-to-testflight true \
             --release-type MANUAL
 
-
-
-
     artifacts:
+      - build/ios/ipa/*.ipa
