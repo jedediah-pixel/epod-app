@@ -22,6 +22,22 @@ workflows:
           pod install --repo-update
           cd ..
 
+      - name: (one-time) Create Apple Distribution cert if missing
+        script: |
+          if [ -z "${CERTIFICATE_PRIVATE_KEY:-}" ]; then
+            echo "Creating Apple Distribution certificate..."
+            app-store-connect certificates create \
+              --type IOS_DISTRIBUTION \
+              --save-private-key CERTIFICATE_PRIVATE_KEY
+            echo "----- COPY EVERYTHING BELOW into a Secure env var named CERTIFICATE_PRIVATE_KEY -----"
+            echo "$CERTIFICATE_PRIVATE_KEY"
+            echo "----- END COPY -----"
+            exit 1
+          else
+            echo "CERTIFICATE_PRIVATE_KEY already set; skipping creation."
+          fi
+
+
       - name: Fetch & install signing (automatic)
         script: |
           app-store-connect fetch-signing-files \
