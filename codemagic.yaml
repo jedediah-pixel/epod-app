@@ -147,9 +147,8 @@ workflows:
         set -e
         app-store-connect publish \
           --path "build/ios/ipa/*.ipa" \
-          --submit-to-testflight true \
+          --submit-to-testflight \
           --release-type MANUAL
-
 
     artifacts:
       - build/ios/ipa/*.ipa
