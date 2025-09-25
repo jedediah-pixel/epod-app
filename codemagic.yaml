@@ -12,9 +12,15 @@ workflows:
         XCODE_PROJECT: ios/Runner.xcodeproj
         XCODE_WORKSPACE: ios/Runner.xcworkspace
       groups:
-        - app_store_credentials   # contains the 4 APP_STORE_CONNECT_* vars + APPLE_TEAM_ID
+        - app_store_credentials   # APP_STORE_CONNECT_* + APPLE_TEAM_ID
 
     scripts:
+      - name: Print tool versions
+        script: |
+          echo "codemagic-cli-tools: $(codemagic-cli-tools version)"
+          app-store-connect --version || true
+          xcode-project --version || true
+
       - name: Flutter pub get
         script: flutter pub get
 
@@ -26,32 +32,38 @@ workflows:
 
       - name: Import distribution P12 and fetch profiles
         script: |
-          # --- sanity checks ---
+          # Ensure the secure vars exist
           if [ -z "${DISTRIBUTION_P12_BASE64:-}" ] || [ -z "${DISTRIBUTION_P12_PASSWORD:-}" ]; then
             echo "ERROR: DISTRIBUTION_P12_BASE64 or DISTRIBUTION_P12_PASSWORD is not set"; exit 2
           fi
 
-          # --- materialize base64 P12 to disk (safe one-liner, no heredoc indentation issues) ---
-          python3 -c 'import os,base64,pathlib; b=os.environ["DISTRIBUTION_P12_BASE64"].strip(); p=pathlib.Path(os.environ["HOME"])/"Library/MobileDevice/Certificates"/"env_cert.p12"; p.parent.mkdir(parents=True,exist_ok=True); p.write_bytes(base64.b64decode(b.encode())); print(p)'
+          # Materialize the base64 .p12 to disk (single-line Python avoids YAML indentation pitfalls)
+          python3 - <<'PY'
+          import os, base64, pathlib
+          b = os.environ["DISTRIBUTION_P12_BASE64"].strip().encode()
+          p = pathlib.Path(os.environ["HOME"]) / "Library/MobileDevice/Certificates" / "env_cert.p12"
+          p.parent.mkdir(parents=True, exist_ok=True)
+          p.write_bytes(base64.b64decode(b))
+          print(p)
+          PY
 
           CERT_DIR="$HOME/Library/MobileDevice/Certificates"
           echo "$CERT_DIR/env_cert.p12"
 
-          # --- create keychain and import the P12 using its password ---
+          # Create keychain and import the P12 with its password
           keychain initialize
           keychain add-certificates \
             --certificate "$CERT_DIR/env_cert.p12" \
             --certificate-pass "$DISTRIBUTION_P12_PASSWORD"
 
-          # --- fetch/create provisioning profiles and apply them ---
-          app-store-connect fetch-signing-files \
-            --bundle-id "$BUNDLE_ID" \
+          # Fetch/create provisioning profiles (positional bundle id for CLI 0.60.x)
+          app-store-connect fetch-signing-files "$BUNDLE_ID" \
             --type IOS_APP_STORE \
             --create
 
+          # Apply profiles to the project (no --scheme on this CLI)
           xcode-project use-profiles \
-            --project "$XCODE_PROJECT" \
-            --scheme "$XCODE_SCHEME"
+            --project "$XCODE_PROJECT"
 
       - name: Build IPA
         script: |
