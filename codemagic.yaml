@@ -11,46 +11,46 @@ workflows:
         XCODE_SCHEME: Runner
       groups:
         - app_store_credentials
-    scripts:
-    - name: Flutter pub get
-      script: flutter pub get
+scripts:
+  - name: Flutter pub get
+    script: flutter pub get
 
-    - name: CocoaPods clean & repo update
-      script: |
-        cd ios
-        rm -rf Pods Podfile.lock
-        pod repo update
-        pod install --repo-update
-        cd ..
+  - name: CocoaPods clean & repo update
+    script: |
+      cd ios
+      rm -rf Pods Podfile.lock
+      pod repo update
+      pod install --repo-update
+      cd ..
 
-    # ⬇️ Fetch/CREATE App Store signing files and apply them to Runner
-    - name: Set up automatic code signing (App Store)
-      script: |
-        keychain initialize
-        app-store-connect fetch-signing-files "$BUNDLE_ID" \
-          --type IOS_APP_STORE \
-          --team-id $APPLE_TEAM_ID \
-          --create
-        keychain add-certificates
-        # Write provisioning to the Xcode project so xcodebuild can sign with CODE_SIGN_STYLE=Manual
-        xcode-project use-profiles
+  # ⬇️ Fetch or create App Store signing files and apply them to the Xcode project
+  - name: Set up automatic code signing (App Store)
+    script: |
+      keychain initialize
+      app-store-connect fetch-signing-files "$BUNDLE_ID" \
+        --type IOS_APP_STORE \
+        --team-id $APPLE_TEAM_ID \
+        --create
+      keychain add-certificates
+      xcode-project use-profiles
 
-    # Optional: print what signing settings are now in the project
-    - name: Show signing settings
-      script: |
-        xcode-project show-build-settings \
-          --workspace "$XCODE_WORKSPACE" \
-          --scheme "$XCODE_SCHEME" | egrep "PRODUCT_BUNDLE_IDENTIFIER|DEVELOPMENT_TEAM|PROVISIONING_PROFILE_SPECIFIER|CODE_SIGN_STYLE"
+  # ⬇️ (Optional but VERY useful) verify that Runner now has a profile & team set
+  - name: Show signing settings
+    script: |
+      xcode-project show-build-settings \
+        --workspace "$XCODE_WORKSPACE" \
+        --scheme "$XCODE_SCHEME" | egrep "PRODUCT_BUNDLE_IDENTIFIER|DEVELOPMENT_TEAM|PROVISIONING_PROFILE_SPECIFIER|CODE_SIGN_STYLE"
 
-    # Build Flutter iOS without signing (archive will sign)
-    - name: Build Flutter iOS (no codesign)
-      script: flutter build ios --release --no-codesign --build-number=$BUILD_NUMBER
+  # ❌ Remove the separate Flutter iOS build — it can overwrite signing settings
+  # - name: Build Flutter iOS (no codesign)
+  #   script: flutter build ios --release --no-codesign --build-number=$BUILD_NUMBER
 
-    - name: Build IPA with Xcode (App Store archive)
-      script: |
-        xcode-project build-ipa \
-          --workspace "$XCODE_WORKSPACE" \
-          --scheme "$XCODE_SCHEME"
+  # ⬇️ Archive + sign using the applied profiles
+  - name: Build IPA with Xcode (App Store archive)
+    script: |
+      xcode-project build-ipa \
+        --workspace "$XCODE_WORKSPACE" \
+        --scheme "$XCODE_SCHEME"
 
 
     artifacts:
