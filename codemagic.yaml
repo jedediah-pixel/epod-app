@@ -1,63 +1,45 @@
 workflows:
   ios_testflight:
     name: iOS → TestFlight (Flutter)
-    max_build_duration: 60
     environment:
       flutter: stable
       xcode: latest
-      vars:
-        BUNDLE_ID: com.yourco.hmepod   # ← put your real bundle id here
-        XCODE_WORKSPACE: ios/Runner.xcworkspace
-        XCODE_SCHEME: Runner
       groups:
         - app_store_credentials
-scripts:
-  - name: Flutter pub get
-    script: flutter pub get
-
-  - name: CocoaPods clean & repo update
-    script: |
-      cd ios
-      rm -rf Pods Podfile.lock
-      pod repo update
-      pod install --repo-update
-      cd ..
-
-  # ⬇️ Fetch or create App Store signing files and apply them to the Xcode project
-  - name: Set up automatic code signing (App Store)
-    script: |
-      keychain initialize
-      app-store-connect fetch-signing-files "$BUNDLE_ID" \
-        --type IOS_APP_STORE \
-        --team-id $APPLE_TEAM_ID \
-        --create
-      keychain add-certificates
-      xcode-project use-profiles
-
-  # ⬇️ (Optional but VERY useful) verify that Runner now has a profile & team set
-  - name: Show signing settings
-    script: |
-      xcode-project show-build-settings \
-        --workspace "$XCODE_WORKSPACE" \
-        --scheme "$XCODE_SCHEME" | egrep "PRODUCT_BUNDLE_IDENTIFIER|DEVELOPMENT_TEAM|PROVISIONING_PROFILE_SPECIFIER|CODE_SIGN_STYLE"
-
-  # ❌ Remove the separate Flutter iOS build — it can overwrite signing settings
-  # - name: Build Flutter iOS (no codesign)
-  #   script: flutter build ios --release --no-codesign --build-number=$BUILD_NUMBER
-
-  # ⬇️ Archive + sign using the applied profiles
-  - name: Build IPA with Xcode (App Store archive)
-    script: |
-      xcode-project build-ipa \
-        --workspace "$XCODE_WORKSPACE" \
-        --scheme "$XCODE_SCHEME"
-
-
+      vars:
+        BUNDLE_ID: com.yourco.hmepod
+        XCODE_WORKSPACE: ios/Runner.xcworkspace
+        XCODE_SCHEME: Runner
+    scripts:
+      - name: Flutter pub get
+        script: flutter pub get
+      - name: CocoaPods clean & install
+        script: |
+          cd ios
+          rm -rf Pods Podfile.lock
+          pod repo update
+          pod install --repo-update
+          cd ..
+      - name: Set up automatic code signing (App Store)
+        script: |
+          keychain initialize
+          app-store-connect fetch-signing-files "$BUNDLE_ID" \
+            --type IOS_APP_STORE \
+            --team-id $APPLE_TEAM_ID \
+            --create
+          keychain add-certificates
+          xcode-project use-profiles
+      - name: Show signing settings
+        script: |
+          xcode-project show-build-settings \
+            --workspace "$XCODE_WORKSPACE" \
+            --scheme "$XCODE_SCHEME" \
+          | egrep "PRODUCT_BUNDLE_IDENTIFIER|DEVELOPMENT_TEAM|PROVISIONING_PROFILE_SPECIFIER|CODE_SIGN_STYLE"
+      - name: Build IPA with Xcode (App Store archive)
+        script: |
+          xcode-project build-ipa \
+            --workspace "$XCODE_WORKSPACE" \
+            --scheme "$XCODE_SCHEME"
     artifacts:
       - build/ios/ipa/*.ipa
-    publishing:
-      app_store_connect:
-        api_key: $APP_STORE_CONNECT_PRIVATE_KEY
-        key_id: $APP_STORE_CONNECT_KEY_IDENTIFIER
-        issuer_id: $APP_STORE_CONNECT_ISSUER_ID
-        submit_to_testflight: true
+      - build/**/dSYMs/**
