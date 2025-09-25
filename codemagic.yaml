@@ -1,6 +1,6 @@
 workflows:
   ios_testflight:
-    name: iOS TestFlight (Flutter)
+    name: iOS → TestFlight (Flutter)
     max_build_duration: 60
 
     environment:
@@ -8,17 +8,15 @@ workflows:
       xcode: latest
       vars:
         BUNDLE_ID: com.yourco.hmepod
-        XCODE_WORKSPACE: ios/Runner.xcworkspace
         XCODE_SCHEME: Runner
+        XCODE_PROJECT: ios/Runner.xcodeproj
+        XCODE_WORKSPACE: ios/Runner.xcworkspace
       groups:
-        - app_store_credentials   # must include: APP_STORE_CONNECT_* , APPLE_TEAM_ID , (NO CERTIFICATE_PRIVATE_KEY here)
+        - app_store_credentials   # contains the 4 APP_STORE_CONNECT_* vars + APPLE_TEAM_ID
 
     scripts:
       - name: Flutter pub get
         script: flutter pub get
-
-      - name: Flutter build iOS (no codesign)
-        script: flutter build ios --release --no-codesign
 
       - name: CocoaPods install
         script: |
@@ -28,47 +26,38 @@ workflows:
 
       - name: Import distribution P12 and fetch profiles
         script: |
-          # Fail early if the secrets are missing
+          # --- sanity checks ---
           if [ -z "${DISTRIBUTION_P12_BASE64:-}" ] || [ -z "${DISTRIBUTION_P12_PASSWORD:-}" ]; then
-            echo "ERROR: DISTRIBUTION_P12_* vars are not set"; exit 2
+            echo "ERROR: DISTRIBUTION_P12_BASE64 or DISTRIBUTION_P12_PASSWORD is not set"; exit 2
           fi
 
+          # --- materialize base64 P12 to disk (safe one-liner, no heredoc indentation issues) ---
+          python3 -c 'import os,base64,pathlib; b=os.environ["DISTRIBUTION_P12_BASE64"].strip(); p=pathlib.Path(os.environ["HOME"])/"Library/MobileDevice/Certificates"/"env_cert.p12"; p.parent.mkdir(parents=True,exist_ok=True); p.write_bytes(base64.b64decode(b.encode())); print(p)'
+
           CERT_DIR="$HOME/Library/MobileDevice/Certificates"
-          mkdir -p "$CERT_DIR"
+          echo "$CERT_DIR/env_cert.p12"
 
-          # Write the base64 .p12 to disk
-          python3 - <<'PY'
-      import os, base64, pathlib
-      b64 = os.environ['DISTRIBUTION_P12_BASE64'].strip()
-      p   = pathlib.Path(os.environ['HOME'])/ 'Library/MobileDevice/Certificates' / 'env_cert.p12'
-      p.write_bytes(base64.b64decode(b64.encode()))
-      print(p)
-      PY
-
+          # --- create keychain and import the P12 using its password ---
           keychain initialize
-          # Import the P12 using its password
           keychain add-certificates \
             --certificate "$CERT_DIR/env_cert.p12" \
             --certificate-pass "$DISTRIBUTION_P12_PASSWORD"
 
-          # Create/download provisioning profile(s) for App Store and install them
+          # --- fetch/create provisioning profiles and apply them ---
           app-store-connect fetch-signing-files \
             --bundle-id "$BUNDLE_ID" \
             --type IOS_APP_STORE \
             --create
 
-          # Apply the profiles to the project
           xcode-project use-profiles \
-            --project ios/Runner.xcodeproj \
+            --project "$XCODE_PROJECT" \
             --scheme "$XCODE_SCHEME"
 
-
-      - name: Show signing settings
+      - name: Build IPA
         script: |
-          xcode-project show-build-settings \
+          xcode-project build-ipa \
             --workspace "$XCODE_WORKSPACE" \
-            --scheme "$XCODE_SCHEME" \
-          | grep -E "PRODUCT_BUNDLE_IDENTIFIER|DEVELOPMENT_TEAM|PROVISIONING_PROFILE_SPECIFIER|CODE_SIGN_STYLE"
+            --scheme "$XCODE_SCHEME"
 
       - name: Publish to TestFlight
         script: |
