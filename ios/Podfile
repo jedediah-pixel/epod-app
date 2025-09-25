@@ -3,18 +3,34 @@
 platform :ios, '13.0'
 ENV['COCOAPODS_DISABLE_STATS'] = 'true'
 
-require_relative 'Flutter/podhelper.rb'
+# Find FLUTTER_ROOT from the generated xcconfig.
+generated = File.expand_path(File.join('..', 'Flutter', 'Generated.xcconfig'), __FILE__)
+unless File.exist?(generated)
+  raise "Generated.xcconfig must exist. Run `flutter pub get` and try again. (Missing: #{generated})"
+end
+
+flutter_root = nil
+File.foreach(generated) do |line|
+  match = line.match(/FLUTTER_ROOT=(.*)/)
+  flutter_root = match[1].strip if match
+end
+raise "FLUTTER_ROOT not found in #{generated}" unless flutter_root
+
+# Load the pod helper from the Flutter SDK (reliable in CI)
+require File.expand_path(File.join('packages', 'flutter_tools', 'bin', 'podhelper'), flutter_root)
 
 flutter_ios_podfile_setup
 
 target 'Runner' do
-  flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))
+  flutter_install_all_ios_pods(File.dirname(File.realpath(__FILE__)))
 end
 
 post_install do |installer|
+  # Apply Flutter’s recommended build settings.
+  flutter_additional_ios_build_settings(installer)
+
+  # Ensure iOS 13.0 across all configs
   installer.pods_project.targets.each do |target|
-    flutter_additional_ios_build_settings(target)
-    # Ensure deployment target is 13.0 in every config
     target.build_configurations.each do |config|
       config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '13.0'
     end
