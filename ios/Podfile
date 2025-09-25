@@ -3,6 +3,9 @@
 platform :ios, '14.0'
 ENV['COCOAPODS_DISABLE_STATS'] = 'true'
 
+# Build Swift pods (Firebase, etc.) as dynamic frameworks
+use_frameworks!
+
 # Read FLUTTER_ROOT from Generated.xcconfig
 generated = File.expand_path(File.join('..', 'Flutter', 'Generated.xcconfig'), __FILE__)
 raise "Run `flutter pub get` to create #{generated}" unless File.exist?(generated)
@@ -25,11 +28,13 @@ target 'Runner' do
 end
 
 post_install do |installer|
-  flutter_additional_ios_build_settings(installer)
-  # Force iOS 14.0 on every target/config so pods like workmanager_apple resolve
-  installer.pods_project.targets.each do |t|
-    t.build_configurations.each do |c|
-      c.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '14.0'
+  # ✅ Call helper on each target (correct signature)
+  installer.pods_project.targets.each do |target|
+    flutter_additional_ios_build_settings(target)
+
+    # Enforce iOS 14.0 everywhere so pods like workmanager_apple resolve
+    target.build_configurations.each do |config|
+      config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '14.0'
     end
   end
 end
