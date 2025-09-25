@@ -1,6 +1,6 @@
 workflows:
   ios_testflight:
-    name: iOS → TestFlight (Flutter)
+    name: iOS TestFlight (Flutter)
     max_build_duration: 60
 
     environment:
@@ -11,11 +11,14 @@ workflows:
         XCODE_WORKSPACE: ios/Runner.xcworkspace
         XCODE_SCHEME: Runner
       groups:
-        - app_store_credentials   # APP_STORE_CONNECT_* , APPLE_TEAM_ID, CERTIFICATE_PRIVATE_KEY
+        - app_store_credentials   # must include: APP_STORE_CONNECT_* , APPLE_TEAM_ID , CERTIFICATE_PRIVATE_KEY
 
     scripts:
       - name: Flutter pub get
         script: flutter pub get
+
+      - name: Flutter build iOS (no codesign)
+        script: flutter build ios --release --no-codesign
 
       - name: CocoaPods install
         script: |
@@ -23,39 +26,34 @@ workflows:
           pod install --repo-update
           cd ..
 
-      - name: Import distribution cert + fetch profiles
+      - name: Import distribution cert and fetch profiles
         script: |
-          # 1) Put your base64 CERTIFICATE_PRIVATE_KEY into a .p12 file
-          python3 - <<'PY'
-import os, base64, pathlib, sys
-b64 = os.environ.get("CERTIFICATE_PRIVATE_KEY","").strip()
-if not b64:
-    print("ERROR: CERTIFICATE_PRIVATE_KEY env var is empty"); sys.exit(2)
-cert_dir = pathlib.Path.home() / "Library/MobileDevice/Certificates"
-cert_dir.mkdir(parents=True, exist_ok=True)
-p12_path = cert_dir / "env_cert.p12"
-p12_path.write_bytes(base64.b64decode(b64))
-print(f"Wrote {p12_path}")
-PY
+          # Ensure the base64 p12 is present
+          if [ -z "${CERTIFICATE_PRIVATE_KEY:-}" ]; then
+            echo "ERROR: CERTIFICATE_PRIVATE_KEY is empty"; exit 2
+          fi
 
-          # 2) Initialize keychain & import that certificate
+          # 1) Write CERTIFICATE_PRIVATE_KEY (base64) to a .p12
+          CERT_DIR="$HOME/Library/MobileDevice/Certificates"
+          mkdir -p "$CERT_DIR"
+          python3 -c "import os,base64,sys,pathlib;p=pathlib.Path(os.environ['HOME'])/'Library/MobileDevice/Certificates'/'env_cert.p12';p.write_bytes(base64.b64decode(os.environ['CERTIFICATE_PRIVATE_KEY'].strip().encode()));print(p)"
+
+          # 2) Initialize keychain & import the cert
           keychain initialize
-          keychain add-certificates --certificate "$HOME/Library/MobileDevice/Certificates/env_cert.p12"
+          keychain add-certificates --certificate "$CERT_DIR/env_cert.p12"
 
-          # 3) Fetch/create provisioning profiles for this bundle id
-          app-store-connect fetch-signing-files "$BUNDLE_ID" \
-            --type IOS_APP_STORE \
-            --create
+          # 3) Fetch/create provisioning profiles for the bundle id
+          app-store-connect fetch-signing-files "$BUNDLE_ID" --type IOS_APP_STORE --create
 
-          # 4) Apply profiles to the Xcode project (your CLI expects --project)
+          # 4) Apply profiles to the Xcode project (this CLI expects --project, not --workspace)
           xcode-project use-profiles --project ios/Runner.xcodeproj
 
-      - name: Show signing settings (sanity check)
+      - name: Show signing settings
         script: |
           xcode-project show-build-settings \
             --workspace "$XCODE_WORKSPACE" \
             --scheme "$XCODE_SCHEME" \
-          | egrep "PRODUCT_BUNDLE_IDENTIFIER|DEVELOPMENT_TEAM|PROVISIONING_PROFILE_SPECIFIER|CODE_SIGN_STYLE"
+          | grep -E "PRODUCT_BUNDLE_IDENTIFIER|DEVELOPMENT_TEAM|PROVISIONING_PROFILE_SPECIFIER|CODE_SIGN_STYLE"
 
       - name: Build IPA
         script: |
