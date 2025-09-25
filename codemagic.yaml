@@ -72,14 +72,14 @@ workflows:
           if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$CERT_DIR/env_cert.p12"; else openssl dgst -sha256 "$CERT_DIR/env_cert.p12"; fi
 
           echo "Checking P12 password (no secrets printed)…"
-          if ! security pkcs12 -in "$CERT_DIR/env_cert.p12" -nocerts -passin "pass:${DISTRIBUTION_P12_PASSWORD}" -nodes >/dev/null 2>&1; then
+          if ! security pkcs12 -in "$CERT_DIR/env_cert.p12" -nocerts -passin "pass:${HMEios2025}" -nodes >/dev/null 2>&1; then
             echo "❌ Wrong DISTRIBUTION_P12_PASSWORD for uploaded P12"; exit 6;
           fi
           echo "✅ P12 password OK"
 
           echo "Certificate subject/issuer from P12:"
           # Extract and show subject/issuer only (no keys)
-          openssl pkcs12 -in "$CERT_DIR/env_cert.p12" -nokeys -passin "pass:${DISTRIBUTION_P12_PASSWORD}" 2>/dev/null | \
+          openssl pkcs12 -in "$CERT_DIR/env_cert.p12" -nokeys -passin "pass:${HMEios2025}" 2>/dev/null | \
           openssl x509 -noout -subject -issuer -enddate || true
 
       - name: Import certificate into keychain
