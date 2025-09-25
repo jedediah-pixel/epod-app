@@ -3,7 +3,7 @@
 platform :ios, '13.0'
 ENV['COCOAPODS_DISABLE_STATS'] = 'true'
 
-require_relative '/Flutter/podhelper.rb'
+require_relative 'Flutter/podhelper.rb'
 
 flutter_ios_podfile_setup
 
