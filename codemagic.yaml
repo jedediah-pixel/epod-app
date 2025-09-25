@@ -40,9 +40,9 @@ workflows:
           CERT_DIR="$HOME/Library/MobileDevice/Certificates"
           mkdir -p "$CERT_DIR"
           python3 -c "import os,base64,sys,pathlib;
-p=pathlib.Path(os.environ['HOME'])/'Library/MobileDevice/Certificates'/'env_cert.p12';
-p.write_bytes(base64.b64decode(os.environ['DISTRIBUTION_P12_BASE64'].strip().encode()));
-print(p)"
+          p=pathlib.Path(os.environ['HOME'])/'Library/MobileDevice/Certificates'/'env_cert.p12';
+          p.write_bytes(base64.b64decode(os.environ['DISTRIBUTION_P12_BASE64'].strip().encode()));
+          print(p)"
 
           # 2) Initialize keychain & import the P12 with password
           keychain initialize
