@@ -2,15 +2,16 @@ workflows:
   ios_testflight:
     name: iOS → TestFlight (Flutter)
     max_build_duration: 60
+
     environment:
       flutter: stable
       xcode: latest
-    vars:
-      BUNDLE_ID: com.yourco.hmepod
-      XCODE_WORKSPACE: ios/Runner.xcworkspace
-      XCODE_SCHEME: Runner
-    groups:
-      - app_store_credentials
+      vars:                        # <-- moved here
+        BUNDLE_ID: com.yourco.hmepod
+        XCODE_WORKSPACE: ios/Runner.xcworkspace
+        XCODE_SCHEME: Runner
+      groups:                      # <-- moved here
+        - app_store_credentials    # (the env group you created with the 4 Apple vars)
 
     scripts:
       - name: Flutter pub get
@@ -24,7 +25,6 @@ workflows:
           pod install
           cd ..
 
-      # ⬇️ Fetch & install certs/profiles, then apply them to the Xcode project
       - name: Fetch signing files
         script: |
           app-store-connect fetch-signing-files "$BUNDLE_ID" \
