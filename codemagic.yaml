@@ -37,10 +37,26 @@ workflows:
       script: |
         set -e
         flutter build ios --release --no-codesign
-        echo "Built Flutter iOS artifacts:"
-        ls -l build/ios/iphoneos/Runner.app | sed -n '1,80p'
-        # Hard fail if assets are missing (this is what leads to white screen)
-        test -d build/ios/iphoneos/Runner.app/flutter_assets || { echo "❌ flutter_assets missing"; exit 3; }
+        APP_DIR="build/ios/iphoneos/Runner.app"
+        echo "Built Flutter iOS artifacts at: $APP_DIR"
+        ls -l "$APP_DIR" | sed -n '1,120p'
+
+        # Accept both current and legacy Flutter layouts
+        ASSETS_1="$APP_DIR/Frameworks/App.framework/flutter_assets"     # modern
+        ASSETS_2="$APP_DIR/flutter_assets"                               # legacy/fallback
+
+        if [ -d "$ASSETS_1" ]; then
+          echo "✅ Found flutter_assets at $ASSETS_1"
+          find "$ASSETS_1" -maxdepth 1 -type f | head -n 10 || true
+        elif [ -d "$ASSETS_2" ]; then
+          echo "✅ Found flutter_assets at $ASSETS_2"
+          find "$ASSETS_2" -maxdepth 1 -type f | head -n 10 || true
+        else
+          echo "❌ flutter_assets not found under expected paths."
+          echo "Directory tree for debugging:"
+          find "$APP_DIR" -maxdepth 3 -type d -name 'flutter_assets' -print
+          exit 3
+        fi
 
     - name: CocoaPods install (with logs)
       script: |
@@ -160,20 +176,27 @@ workflows:
         set -e
         xcode-project build-ipa --workspace "$XCODE_WORKSPACE" --scheme "$XCODE_SCHEME"
 
-          - name: Sanity-check IPA contains Flutter assets
-        script: |
-          set -e
-          IPA=$(ls build/ios/ipa/*.ipa | head -n 1)
-          tmpdir=$(mktemp -d)
-          unzip -q "$IPA" -d "$tmpdir"
-          APPDIR=$(find "$tmpdir/Payload" -maxdepth 1 -name "*.app" | head -n 1)
-          echo "Looking for flutter_assets in: $APPDIR"
-          if [ ! -d "$APPDIR/flutter_assets" ]; then
-            echo "❌ No flutter_assets inside IPA. This build would show a white screen."
-            find "$APPDIR" -maxdepth 2 -type d -name "flutter_assets" || true
-            exit 4
-          fi
-          echo "✅ flutter_assets present"
+    - name: Sanity-check IPA contains Flutter assets
+      script: |
+        set -e
+        IPA=$(ls build/ios/ipa/*.ipa | head -n 1)
+        tmpdir=$(mktemp -d)
+        unzip -q "$IPA" -d "$tmpdir"
+        APPDIR=$(find "$tmpdir/Payload" -maxdepth 1 -name "*.app" | head -n 1)
+        echo "Checking inside IPA app dir: $APPDIR"
+
+        ASSETS_1="$APPDIR/Frameworks/App.framework/flutter_assets"
+        ASSETS_2="$APPDIR/flutter_assets"
+
+        if [ -d "$ASSETS_1" ] || [ -d "$ASSETS_2" ]; then
+          echo "✅ flutter_assets present in IPA"
+        else
+          echo "❌ No flutter_assets inside IPA. This would cause a white screen."
+          echo "Searching for any flutter_assets folders:"
+          find "$APPDIR" -type d -name "flutter_assets" -maxdepth 4 -print || true
+          exit 4
+        fi
+
 
 
     - name: Show publish help (debug)
