@@ -1,5 +1,6 @@
 import UIKit
 import Flutter
+import UserNotifications
 
 @UIApplicationMain
 class AppDelegate: FlutterAppDelegate {
@@ -45,6 +46,14 @@ class AppDelegate: FlutterAppDelegate {
         headers: headers
       )
       result(true)
+    }
+
+    // 1) Register all Flutter plugins (required for Workmanager, notifications, etc.)
+    GeneratedPluginRegistrant.register(with: self)
+
+    // 2) Let local notifications show when app is foregrounded
+    if #available(iOS 10.0, *) {
+      UNUserNotificationCenter.current().delegate = self
     }
 
     return super.application(application, didFinishLaunchingWithOptions: launchOptions)

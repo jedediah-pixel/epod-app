@@ -14,10 +14,19 @@ class UploadNotifications {
     // Android init (no-op on iOS for our use case)
     const AndroidInitializationSettings androidInit =
         AndroidInitializationSettings('@mipmap/ic_launcher');
+    
+    // Add this iOS init just above initSettings
+    const DarwinInitializationSettings darwinInit = DarwinInitializationSettings(
+      requestAlertPermission: true,
+      requestBadgePermission: true,
+      requestSoundPermission: true,
+    );
 
-    // Action button handler (Android)
-    final InitializationSettings initSettings =
-        const InitializationSettings(android: androidInit);
+    // Replace your current initSettings with this:
+    const InitializationSettings initSettings = InitializationSettings(
+      android: androidInit,
+      iOS: darwinInit,
+    );
 
     await _plugin.initialize(
       initSettings,
