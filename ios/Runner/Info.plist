@@ -2,6 +2,23 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<!-- Required: you referenced camera APIs -->
+	<key>NSCameraUsageDescription</key>
+	<string>We use the camera to capture delivery proof photos.</string>
+
+	<!-- Add the ones below only if your app actually does this: -->
+	<!-- Pick existing photos -->
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>We access your photos so you can attach delivery proof from your library.</string>
+
+	<!-- Save photos to the library -->
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>We save photos you take so they’re available in your photo library.</string>
+
+	<!-- Record video with sound (only if you capture video) -->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>We need the microphone to record audio while capturing delivery videos.</string>
+
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
