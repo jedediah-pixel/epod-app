@@ -33,6 +33,15 @@ workflows:
     - name: Flutter pub get
       script: flutter pub get
 
+    - name: Build Flutter iOS (AOT + assets)
+            script: |
+              set -e
+              flutter build ios --release --no-codesign
+              echo "Built Flutter iOS artifacts:"
+              ls -l build/ios/iphoneos/Runner.app | sed -n '1,80p'
+              # Hard fail if assets are missing (this is what leads to white screen)
+              test -d build/ios/iphoneos/Runner.app/flutter_assets || { echo "❌ flutter_assets missing"; exit 3; }
+
     - name: CocoaPods install (with logs)
       script: |
         set -e
@@ -150,6 +159,22 @@ workflows:
       script: |
         set -e
         xcode-project build-ipa --workspace "$XCODE_WORKSPACE" --scheme "$XCODE_SCHEME"
+
+          - name: Sanity-check IPA contains Flutter assets
+        script: |
+          set -e
+          IPA=$(ls build/ios/ipa/*.ipa | head -n 1)
+          tmpdir=$(mktemp -d)
+          unzip -q "$IPA" -d "$tmpdir"
+          APPDIR=$(find "$tmpdir/Payload" -maxdepth 1 -name "*.app" | head -n 1)
+          echo "Looking for flutter_assets in: $APPDIR"
+          if [ ! -d "$APPDIR/flutter_assets" ]; then
+            echo "❌ No flutter_assets inside IPA. This build would show a white screen."
+            find "$APPDIR" -maxdepth 2 -type d -name "flutter_assets" || true
+            exit 4
+          fi
+          echo "✅ flutter_assets present"
+
 
     - name: Show publish help (debug)
       script: app-store-connect publish --help
