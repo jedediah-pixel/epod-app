@@ -34,13 +34,13 @@ workflows:
       script: flutter pub get
 
     - name: Build Flutter iOS (AOT + assets)
-            script: |
-              set -e
-              flutter build ios --release --no-codesign
-              echo "Built Flutter iOS artifacts:"
-              ls -l build/ios/iphoneos/Runner.app | sed -n '1,80p'
-              # Hard fail if assets are missing (this is what leads to white screen)
-              test -d build/ios/iphoneos/Runner.app/flutter_assets || { echo "❌ flutter_assets missing"; exit 3; }
+      script: |
+        set -e
+        flutter build ios --release --no-codesign
+        echo "Built Flutter iOS artifacts:"
+        ls -l build/ios/iphoneos/Runner.app | sed -n '1,80p'
+        # Hard fail if assets are missing (this is what leads to white screen)
+        test -d build/ios/iphoneos/Runner.app/flutter_assets || { echo "❌ flutter_assets missing"; exit 3; }
 
     - name: CocoaPods install (with logs)
       script: |
