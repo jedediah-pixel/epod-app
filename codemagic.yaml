@@ -119,6 +119,16 @@ workflows:
         xcodebuild -workspace "$XCODE_WORKSPACE" -scheme "$XCODE_SCHEME" -showBuildSettings | \
           egrep "PRODUCT_BUNDLE_IDENTIFIER|DEVELOPMENT_TEAM|CODE_SIGN_STYLE|PROVISIONING_PROFILE_SPECIFIER|CODE_SIGNING_ALLOWED" || true
         echo "-------------------------------------------------"
+    
+    - name: Compute next build number from App Store Connect
+      script: |
+        set -e
+        # Query the latest build number for this bundle id on iOS (returns 0 if none)
+        LATEST=$(app-store-connect get-latest-build-number "$BUNDLE_ID" --platform IOS || echo 0)
+        echo "Latest build on ASC: $LATEST"
+        NEXT=$((LATEST + 1))
+        echo "export NEXT_BUILD=$NEXT" >> $CM_ENV
+        echo "Using NEXT_BUILD=$NEXT"
 
     - name: Build archive (verbose failure if codesign missing)
       script: |
@@ -130,8 +140,10 @@ workflows:
                   -archivePath build/ios/xcarchive/Runner.xcarchive \
                   archive \
                   CODE_SIGN_STYLE=Manual \
+                  CURRENT_PROJECT_VERSION="$NEXT_BUILD" \
+                  MARKETING_VERSION="1.0.0" \
                   COMPILER_INDEX_STORE_ENABLE=NO | xcpretty || {
-          echo "❌ xcodebuild archive failed. Dumping identities and profiles:"
+          echo "❌ xcodebuild archive failed. Dumping recent signing identities and profiles for debugging:"
           security find-identity -v -p codesigning || true
           ls -l "$HOME/Library/MobileDevice/Provisioning Profiles" || true
           exit 1
@@ -150,7 +162,6 @@ workflows:
       script: |
         set -e
         app-store-connect publish --path "build/ios/ipa/*.ipa"
-
 
     artifacts:
       - build/ios/ipa/*.ipa
