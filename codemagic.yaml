@@ -120,15 +120,12 @@ workflows:
           egrep "PRODUCT_BUNDLE_IDENTIFIER|DEVELOPMENT_TEAM|CODE_SIGN_STYLE|PROVISIONING_PROFILE_SPECIFIER|CODE_SIGNING_ALLOWED" || true
         echo "-------------------------------------------------"
     
-    - name: Compute next build number from App Store Connect
+    - name: Set build number (manual)
       script: |
-        set -e
-        # Query the latest build number for this bundle id on iOS (returns 0 if none)
-        LATEST=$(app-store-connect get-latest-build-number "$BUNDLE_ID" --platform IOS || echo 0)
-        echo "Latest build on ASC: $LATEST"
-        NEXT=$((LATEST + 1))
-        echo "export NEXT_BUILD=$NEXT" >> $CM_ENV
-        echo "Using NEXT_BUILD=$NEXT"
+        export NEXT_BUILD=2
+        echo "export NEXT_BUILD=$NEXT_BUILD" >> $CM_ENV
+        echo "Using build number $NEXT_BUILD"
+
 
     - name: Build archive (verbose failure if codesign missing)
       script: |
