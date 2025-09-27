@@ -344,6 +344,31 @@ class UploadQueue {
     _sessionDriverId= driverId;
   }
 
+  String _publicUrlFromSigned(String signed) {
+    final uri = Uri.parse(signed);
+    var segs = List.of(uri.pathSegments);
+    if (segs.isNotEmpty && segs.first == 'hm-epod') segs = segs.sublist(1);
+    return '$_bucketBase/${segs.join('/')}';
+  }
+
+  // Poll S3 (HEAD) until the object exists, so embeds can fetch it.
+  Future<bool> _waitForS3(String url, {int timeoutSec = 45}) async {
+    final started = DateTime.now();
+    var delay = const Duration(milliseconds: 400); // backoff: 0.4s → 3s
+    while (DateTime.now().difference(started).inSeconds < timeoutSec) {
+      try {
+        final res = await http.head(Uri.parse(url));
+        if (res.statusCode == 200) return true;
+        // 403/404 → not there yet; keep waiting
+      } catch (_) {}
+      await Future.delayed(delay);
+      delay *= 2;
+      if (delay > const Duration(seconds: 3)) delay = const Duration(seconds: 3);
+    }
+    debugPrint('WM[barcode_uploader]: timeout waiting for S3: $url');
+    return false;
+  }
+
   // Expose the internal pump as a public method for WorkManager isolate.
   static final UploadQueue instance = UploadQueue._internal();
   UploadQueue._internal();
@@ -736,42 +761,43 @@ Future<bool> _process(UploadJob j) async {
       }
 
       debugPrint('WM[barcode_uploader]: PUT start job=${j.id} file=$imgPath');
-      final _iosStarted = await IOSBgUpload.start(
-        filePath: imgPath,
-        presignedUrl: signed,
-        headers: {'Content-Type': 'image/jpeg'},
-        method: 'PUT',
-      );
-      if (_iosStarted) {
-        debugPrint('WM[barcode_uploader]: iOS background PUT started for $imgPath');
-        final uri = Uri.parse(signed);
-        var segs = List.of(uri.pathSegments);
-        if (segs.isNotEmpty && segs.first == 'hm-epod') segs = segs.sublist(1);
-        urls.add('$_bucketBase/${segs.join('/')}');
-        continue;
-      }
+      if (Platform.isIOS) {
+  // iOS: start the background upload…
+  final started = await IOSBgUpload.start(
+    filePath: imgPath,
+    presignedUrl: signed,
+    headers: {'Content-Type': 'image/jpeg'},
+    method: 'PUT',
+  );
+  if (!started) {
+    // Couldn’t start; let WorkManager retry later.
+    return false;
+  }
 
-      final put = await _dio.put(
-        signed,
-        data: await imgFile.readAsBytes(),
-        options: Options(
-          headers: {'Content-Type': 'image/jpeg'},
-          followRedirects: false,
-          validateStatus: (_) => true,
-        ),
-      );
-      debugPrint('WM[barcode_uploader]: PUT done job=${j.id} status=${put.statusCode}');
-      final putCode = put.statusCode ?? 0;
-      if (putCode != 200 && putCode != 201 && putCode != 204) {
-        if (_isPermanentPut(putCode)) throw PermanentFail('put:$putCode');
-        return false;
-      }
+  // …then WAIT until S3 returns 200 so Discord can fetch it.
+  final pubUrl = _publicUrlFromSigned(signed);
+  final ok = await _waitForS3(pubUrl, timeoutSec: 60);
+  if (!ok) return false; // not visible yet → retry later
 
-      // 3) derive public URL
-      final uri = Uri.parse(signed);
-      var segs = List.of(uri.pathSegments);
-      if (segs.isNotEmpty && segs.first == 'hm-epod') segs = segs.sublist(1);
-      urls.add('$_bucketBase/${segs.join('/')}');
+  urls.add(pubUrl);
+} else {
+  // Android: do the normal awaited PUT
+  final put = await _dio.put(
+    signed,
+    data: await imgFile.readAsBytes(),
+    options: Options(
+      headers: {'Content-Type': 'image/jpeg'},
+      followRedirects: false,
+      validateStatus: (_) => true,
+    ),
+  );
+  debugPrint('WM[barcode_uploader]: PUT done job=${j.id} status=${put.statusCode}');
+  final code = put.statusCode ?? 0;
+  if (code != 200 && code != 201 && code != 204) return false;
+
+  urls.add(_publicUrlFromSigned(signed));
+}
+
     }
 
     // ---- Manifest (status + urls) ----
