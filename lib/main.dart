@@ -30,6 +30,25 @@ void uploadCallbackDispatcher() {
 
     await UploadQueue.instance.init();
     await UploadQueue.instance.rescanFromDisk();
+        // ===== B) RESTORE SESSION FOR BACKGROUND ISOLATE (ADD THIS) =====
+    // Make sure you have:  import 'package:shared_preferences/shared_preferences.dart';
+    final prefs   = await SharedPreferences.getInstance();
+    final driver  = prefs.getString('session.driverId');
+    final day     = prefs.getString('session.day');
+    final token   = prefs.getString('session.token');
+
+    if (driver != null && day != null && token != null) {
+      // If you already have a setter on your queue, use it:
+      UploadQueue.instance.setSession(
+        driverId: driver,
+        day: day,
+        token: token,
+      );
+      debugPrint('WM[barcode_uploader]: restored session driver=$driver day=$day');
+    } else {
+      debugPrint('WM[barcode_uploader]: no saved session -> may hit no_session_for_day');
+    }
+    // ===== END B) =====
     try {
       final dir = Directory('${(await getApplicationDocumentsDirectory()).path}/upload_queue');
       final list = await dir.list(recursive: true).toList();
@@ -310,6 +329,20 @@ class PermanentFail implements Exception {
 }
 
 class UploadQueue {
+
+  String? _sessionDriverId;
+  String? _sessionDay;
+  String? _sessionToken;
+
+  void setSession({
+    required String token,
+    required String day,
+    required String driverId,
+  }) {
+    _sessionToken   = token;
+    _sessionDay     = day;
+    _sessionDriverId= driverId;
+  }
 
   // Expose the internal pump as a public method for WorkManager isolate.
   static final UploadQueue instance = UploadQueue._internal();
@@ -611,6 +644,16 @@ Future<bool> _process(UploadJob j) async {
 
   try {
     final day = _ymdFromRdd(j.rddDate); // POD’s actual day
+    // Use job’s JWT if present; else fallback to a saved JWT for this driver/day
+    String? jwtToken = j.sessionToken;
+    if (jwtToken == null || jwtToken.isEmpty) {
+      final sp = await SharedPreferences.getInstance();
+      final u = (j.username ?? '').toLowerCase();
+      // Try a per-day token if you ever save it, then a general latest token
+      jwtToken = sp.getString('sess.token.$u.$day')
+              ?? sp.getString('sess.token.$u');
+    }
+
     debugPrint('WM[barcode_uploader]: job=${j.id} pod=${j.podNo} images=${j.imagePaths.length} day=$day');
 
     // ---- Age guard: today .. 6 days old (no future) ----
@@ -621,19 +664,27 @@ Future<bool> _process(UploadJob j) async {
     }
 
     // ---- JWT fallback: if job has no token, try per-day cache (then legacy) ----
-    String? jwtToken = j.sessionToken;
+
     if (jwtToken == null) {
       final sp = await SharedPreferences.getInstance();
       final u = (j.username ?? '').toLowerCase();
-      jwtToken = sp.getString('sess.token.$u.$today') ?? sp.getString('sess.token.$u');
+      jwtToken = sp.getString('sess.token.$u.$day') ?? sp.getString('sess.token.$u');
       if (jwtToken != null) {
         debugPrint('WM[barcode_uploader]: using cached JWT for $u on $today');
       }
     }
 
     Map<String, String> _auth(String contentType, String key) {
-      if (jwtToken == null) throw PermanentFail('no_session_for_day');
-      return {'Content-Type': contentType, 'Authorization': 'Bearer $jwtToken'};
+      final t = jwtToken;
+      if (t == null || t.isEmpty) {
+        throw PermanentFail('no_session_token');
+      }
+      return {
+        'Authorization': 'Bearer $t',
+        'Content-Type': contentType,
+        'x-api-key': key,
+        // No 'x-session-day' header needed if your backend validates the JWT
+      };
     }
 
     bool _isPermanentSign(int code, String body) {
@@ -1597,6 +1648,19 @@ Future<void> _adminOpenUploadOnBehalf({
       day: day,
     );
     final token = (approve['token'] as String).trim();
+
+    // Cache for background isolate reuse
+    final sp = await SharedPreferences.getInstance();
+    final u = driverId.toLowerCase();
+    await sp.setString('sess.token.$u', token);
+    await sp.setString('sess.token.$u.$day', token); // optional per-day cache
+
+    // ...
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('session.driverId', driverId);
+    await prefs.setString('session.day', day);          // yyyy-MM-dd
+    await prefs.setString('session.token', token);      // JWT from approveApp
+
     await UploadQueue.instance.rememberSession(driverId: driverId, day: day, token: token);
 
     final podId    = _podIdFromRow(row);
