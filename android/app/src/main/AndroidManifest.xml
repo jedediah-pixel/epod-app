@@ -50,17 +50,6 @@
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 
-        <!-- Kick drain after reboot (optional but recommended) -->
-        <receiver
-            android:name=".BootReceiver"
-            android:enabled="true"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="android.intent.action.BOOT_COMPLETED" />
-                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
-            </intent-filter>
-        </receiver>
-
         <!-- Flutter + FileProvider (unchanged) -->
         <meta-data android:name="flutterEmbedding" android:value="2" />
         <provider

@@ -72,6 +72,8 @@ Future<void> _requestAndroidPostNotifications() async {
 const _bucketBase = 'https://hm-epod.s3.ap-southeast-1.amazonaws.com';
 // ===== Admin API base =====
 const String kApiBase = 'https://s3-upload-api-trvm.onrender.com';
+// Base URL (NO trailing slash). Use your bucket or CDN domain.
+const kS3Base = 'https://hm-epod.s3.ap-southeast-1.amazonaws.com';
 
 // ===== SharedPreferences keys =====
 const String kSpAdminToken = 'adminToken';
@@ -310,7 +312,22 @@ class PermanentFail implements Exception {
 class UploadQueue {
 
   // Expose the internal pump as a public method for WorkManager isolate.
-  
+  static final UploadQueue instance = UploadQueue._internal();
+  UploadQueue._internal();
+  factory UploadQueue() => instance;
+
+  Future<void> rememberSession({
+    required String driverId,
+    required String day,          // yyyy-MM-dd
+    required String token,
+  }) async {
+    final prefs = await SharedPreferences.getInstance();
+    // Save under both keys to be safe with existing _auth() implementations
+    await prefs.setString('session.$day', token);
+    await prefs.setString('session.$driverId.$day', token);
+  }
+
+
   Future<bool> drain() async {
     // ensure disk state is loaded when called from WM isolate
     await runHeadlessUntilEmpty();
@@ -345,7 +362,6 @@ class UploadQueue {
   }
 
   UploadQueue._();
-  static final UploadQueue instance = UploadQueue._();
 
   final Dio _dio = Dio(BaseOptions(
     connectTimeout: const Duration(seconds: 10),
@@ -586,93 +602,89 @@ Future<int> deleteQueueCopiesForPod({
     return Duration(seconds: steps[min(attempts, steps.length) - 1]);
   }
 
-  Future<bool> _process(UploadJob j) async {
-    debugPrint('DEBUG5 process: id=${j.id} pod=${j.podNo} '
-           'day=${_ymdFromRdd(j.rddDate)} '
-           'imgs=${j.imagePaths.length}');
-    for (final p in j.imagePaths) {
-      debugPrint('DEBUG5 imgPath=$p exists=${await File(p).exists()}');
+Future<bool> _process(UploadJob j) async {
+  debugPrint('DEBUG5 process: id=${j.id} pod=${j.podNo} '
+      'day=${_ymdFromRdd(j.rddDate)} imgs=${j.imagePaths.length}');
+  for (final p in j.imagePaths) {
+    debugPrint('DEBUG5 imgPath=$p exists=${await File(p).exists()}');
+  }
+
+  try {
+    final day = _ymdFromRdd(j.rddDate); // POD’s actual day
+    debugPrint('WM[barcode_uploader]: job=${j.id} pod=${j.podNo} images=${j.imagePaths.length} day=$day');
+
+    // ---- Age guard: today .. 6 days old (no future) ----
+    final today = _todayYMD();
+    final diff = _daysBetweenYmd(day, today); // positive if 'day' after today
+    if (diff < -6 || diff > 0) {
+      throw PermanentFail('day_out_of_window:$day');
     }
 
-    try {
-      final day = _ymdFromRdd(j.rddDate);   // always the POD’s actual day
-      debugPrint('WM[barcode_uploader]: job=${j.id} pod=${j.podNo} images=${j.imagePaths.length} day=$day');
-
-      // ---- Age guard: only today .. 6 days old allowed (no future) ----
-      final today = _todayYMD();
-      final diff = _daysBetweenYmd(day, today); // positive if 'day' after today
-      if (diff < -6 || diff > 0) {
-        throw PermanentFail('day_out_of_window:$day');
+    // ---- JWT fallback: if job has no token, try per-day cache (then legacy) ----
+    String? jwtToken = j.sessionToken;
+    if (jwtToken == null) {
+      final sp = await SharedPreferences.getInstance();
+      final u = (j.username ?? '').toLowerCase();
+      jwtToken = sp.getString('sess.token.$u.$today') ?? sp.getString('sess.token.$u');
+      if (jwtToken != null) {
+        debugPrint('WM[barcode_uploader]: using cached JWT for $u on $today');
       }
+    }
 
-      Map<String,String> _auth(String contentType, String key) {
-        final canJwt = j.sessionToken != null;  // no day check
-        if (!canJwt) {
-          // hard-stop this job: no valid session for the target day
-          throw PermanentFail('no_session_for_day');
-        }
-        return {
-          'Content-Type': contentType,
-          'Authorization': 'Bearer ${j.sessionToken!}',
-        };
-      }
+    Map<String, String> _auth(String contentType, String key) {
+      if (jwtToken == null) throw PermanentFail('no_session_for_day');
+      return {'Content-Type': contentType, 'Authorization': 'Bearer $jwtToken'};
+    }
 
-      bool _isPermanentSign(int code, String body) {
-        if (code == 400 || code == 401 || code == 403 || code == 404) return true;
-        final b = body.toLowerCase();
-        return b.contains('too_old_or_future') ||
-              b.contains('key_not_allowed') ||
-              b.contains('driver_or_day_mismatch') ||
-              b.contains('session_required_for_today');
-      }
+    bool _isPermanentSign(int code, String body) {
+      if (code == 400 || code == 401 || code == 403 || code == 404) return true;
+      final b = body.toLowerCase();
+      return b.contains('too_old_or_future') ||
+             b.contains('key_not_allowed') ||
+             b.contains('driver_or_day_mismatch') ||
+             b.contains('session_required_for_today') ||
+             b.contains('no_session_for_day');
+    }
 
-      bool _isPermanentPut(int code) {
-        // Treat all PUT failures as transient (403/400/404 often = expired presign).
-        return false;
-      }
+    bool _isPermanentPut(int code) => false; // all PUT failures -> retryable
 
-      final urls = <String>[];
+    final urls = <String>[];
 
-      // ---- Upload each image ----
-      for (var i = 0; i < j.imagePaths.length; i++) {
-      final key = 'pods/$day/${j.username}/${j.podNo}_${i + 1}.jpg';
+    // ---- Upload each image ----
+    for (var i = 0; i < j.imagePaths.length; i++) {
+      final key = 'pods/$day/${(j.username ?? '').toLowerCase()}/${j.podNo}_${i + 1}.jpg';
 
       // 1) sign (get presigned PUT URL)
+      debugPrint('WM[barcode_uploader]: AUTH tokenLen=${jwtToken?.length ?? 0} key=$key');
       final signRes = await http.post(
         Uri.parse('$kApiBase/sign'),
         headers: _auth('application/json', key),
         body: jsonEncode({'filename': key, 'contentType': 'image/jpeg'}),
       );
 
-      // — added: explicit log + strict status check
-      debugPrint('WM[barcode_uploader]: manifest ${signRes.statusCode} for job=${j.id} fileIdx=${i + 1}');
+      final bodyStr = signRes.body;
+      final bodyLog = bodyStr.length > 300 ? '${bodyStr.substring(0, 300)}…' : bodyStr;
+      debugPrint('WM[barcode_uploader]: sign ${signRes.statusCode} job=${j.id} fileIdx=${i + 1} body=$bodyLog');
+
       if (signRes.statusCode != 200) {
-        final body = signRes.body;
-        if (_isPermanentSign(signRes.statusCode, body)) {
-          // permanent (e.g., auth/validation) -> bubble up and mark job failed
-          throw PermanentFail(
-            'sign:${signRes.statusCode}:${body.substring(0, body.length.clamp(0, 200))}',
-          );
+        if (_isPermanentSign(signRes.statusCode, bodyStr)) {
+          throw PermanentFail('sign:${signRes.statusCode}:${bodyLog}');
         }
-        // transient (e.g., network/server) -> let WorkManager retry
-        return false;
+        return false; // transient -> WM retry
       }
 
       final signed = (jsonDecode(signRes.body)['url'] as String);
 
-      // 2) PUT to S3 (robust)
+      // 2) PUT to S3
       final imgPath = j.imagePaths[i];
       final imgFile = File(imgPath);
       if (!await imgFile.exists()) {
-        // — added: guard if the file disappeared due to a race/cleanup
         debugPrint('WM[barcode_uploader]: missing image; skip job=${j.id} path=$imgPath');
-        await rescanFromDisk();                 // refresh in-memory from disk
-        throw Exception('image missing');       // mark this attempt as failed so WM retries
+        await rescanFromDisk();
+        throw Exception('image missing');
       }
 
-      // — added: start/finish logs + validateStatus so Dio never throws for non-2xx
       debugPrint('WM[barcode_uploader]: PUT start job=${j.id} file=$imgPath');
-      // iOS: hand off to background URLSession (continues after app is closed)
       final _iosStarted = await IOSBgUpload.start(
         filePath: imgPath,
         presignedUrl: signed,
@@ -681,136 +693,106 @@ Future<int> deleteQueueCopiesForPod({
       );
       if (_iosStarted) {
         debugPrint('WM[barcode_uploader]: iOS background PUT started for $imgPath');
-
-        // iOS-only: add the public URL now (PUT continues in background).
         final uri = Uri.parse(signed);
         var segs = List.of(uri.pathSegments);
         if (segs.isNotEmpty && segs.first == 'hm-epod') segs = segs.sublist(1);
         urls.add('$_bucketBase/${segs.join('/')}');
-
-        continue; // Android code path remains unchanged below
+        continue;
       }
 
       final put = await _dio.put(
         signed,
         data: await imgFile.readAsBytes(),
         options: Options(
-          headers: {
-            'Content-Type': 'image/jpeg', // keep in sync with how the URL was signed
-          },
+          headers: {'Content-Type': 'image/jpeg'},
           followRedirects: false,
-          validateStatus: (_) => true,    // we validate below
+          validateStatus: (_) => true,
         ),
       );
       debugPrint('WM[barcode_uploader]: PUT done job=${j.id} status=${put.statusCode}');
-
       final putCode = put.statusCode ?? 0;
-
-      // — changed: accept 200/201/204 as success; treat others as retryable unless permanent
       if (putCode != 200 && putCode != 201 && putCode != 204) {
-        if (_isPermanentPut(putCode)) {
-          throw PermanentFail('put:$putCode');
-        }
-        return false; // transient (e.g., 403 expired URL, 5xx); WM will retry
+        if (_isPermanentPut(putCode)) throw PermanentFail('put:$putCode');
+        return false;
       }
 
-      // 3) derive public URL (unchanged logic, just kept here)
+      // 3) derive public URL
       final uri = Uri.parse(signed);
       var segs = List.of(uri.pathSegments);
       if (segs.isNotEmpty && segs.first == 'hm-epod') segs = segs.sublist(1);
       urls.add('$_bucketBase/${segs.join('/')}');
     }
 
-      // ---- Manifest (status + urls) ----
-      final manifestKey = 'pods/$day/${j.username}/${j.podNo}_meta.json';
-      final manifestSign = await http.post(
-        Uri.parse('$kApiBase/sign'),
-        headers: _auth('application/json', manifestKey),
-        body: jsonEncode({'filename': manifestKey, 'contentType': 'application/json'}),
-      );
+    // ---- Manifest (status + urls) ----
+    final manifestKey = 'pods/$day/${(j.username ?? '').toLowerCase()}/${j.podNo}_meta.json';
+    final manifestSign = await http.post(
+      Uri.parse('$kApiBase/sign'),
+      headers: _auth('application/json', manifestKey),
+      body: jsonEncode({'filename': manifestKey, 'contentType': 'application/json'}),
+    );
+    final mBodyStr = manifestSign.body;
+    final mBodyLog = mBodyStr.length > 300 ? '${mBodyStr.substring(0, 300)}…' : mBodyStr;
+    debugPrint('WM[barcode_uploader]: sign(manifest) ${manifestSign.statusCode} job=${j.id} body=$mBodyLog');
 
-      if (manifestSign.statusCode != 200) {
-        final body = manifestSign.body;
-        if (_isPermanentSign(manifestSign.statusCode, body)) {
-          throw PermanentFail('sign_manifest:${manifestSign.statusCode}');
-        }
-        return false; // transient
+    if (manifestSign.statusCode != 200) {
+      if (_isPermanentSign(manifestSign.statusCode, mBodyStr)) {
+        throw PermanentFail('sign_manifest:${manifestSign.statusCode}:${mBodyLog}');
       }
-
-      final manifestUrl = (jsonDecode(manifestSign.body)['url'] as String);
-      final status = j.isRejected ? 'rejected' : 'delivered';
-
-      final putManifest = await _dio.put(
-        manifestUrl,
-        data: utf8.encode(jsonEncode({
-          'podNo': j.podNo,
-          'status': status,
-          'urls': urls,
-          'updatedBy': j.username,
-          'updatedAt': DateTime.now().toIso8601String(),
-        })),
-        options: Options(headers: {'Content-Type': 'application/json'}),
-      );
-
-      final manCode = putManifest.statusCode ?? 0;
-      debugPrint('WM[barcode_uploader]: manifest PUT status=$manCode for job=${j.id}');
-      if (manCode != 200 && manCode != 201 && manCode != 204) {
-        if (_isPermanentPut(manCode)) {
-          throw PermanentFail('put_manifest:$manCode');
-        }
-        return false; // transient -> WorkManager will retry; but don't call /notify yet
-      }
-
-      if (manCode != 200) {
-        if (_isPermanentPut(manCode)) {
-          throw PermanentFail('put_manifest:$manCode');
-        }
-        return false; // transient
-      }
-
-      // ---- Notify AFTER manifest succeeds (avoid double pings on retry) ----
-
-      // Ask server to verify images and write a receipt
-      try {
-        await http.post(
-          Uri.parse('$kApiBase/ack'),
-          headers: _auth('application/json', 'pods/$day/${j.username}/${j.podNo}_1.jpg')
-            ..addAll({
-              // if you enabled the optional API key above, set it here:
-              // 'x-api-key': kAckKey,
-              'x-driver': (j.username ?? '').toLowerCase(), // server can read from header too
-            }),
-          body: jsonEncode({
-            'podNo': j.podNo,
-            'day': day,
-            'username': (j.username ?? '').toLowerCase(),  // <-- so /ack works without session
-          }),
-        );
-      } catch (_) {
-        // best-effort; badge will flip ✓ on next hydrate if receipt appears
-      }
-
-      try {
-        final anyKey = 'pods/$day/${j.username}/${j.podNo}_1.jpg';
-        await http.post(
-          Uri.parse('$kApiBase/notify'),
-          headers: _auth('application/json', anyKey),
-          body: jsonEncode({
-            'content': '📦 DO: ${j.podNo}\n${j.isRejected ? '❌ Rejected' : '✅ Delivered'}\n🚚 ${j.username}\n📅 ${j.rddDate}',
-            'imageUrls': urls,
-          }),
-        );
-      } catch (_) {
-        // best-effort; ignore notify errors
-      }
-
-      return true; // all good
-    } catch (e, st) {
-      debugPrint('UploadQueue _process error: $e\n$st');
-      if (e is PermanentFail) rethrow; // let _pump() handle it
-      return false; // transient / unknown
+      return false;
     }
+
+    final manifestUrl = (jsonDecode(manifestSign.body)['url'] as String);
+    final status = j.isRejected ? 'rejected' : 'delivered';
+
+    final putManifest = await _dio.put(
+      manifestUrl,
+      data: utf8.encode(jsonEncode({
+        'podNo': j.podNo,
+        'status': status,
+        'urls': urls,
+        'updatedBy': (j.username ?? '').toLowerCase(),
+        'updatedAt': DateTime.now().toIso8601String(),
+      })),
+      options: Options(headers: {'Content-Type': 'application/json'}),
+    );
+
+    final manCode = putManifest.statusCode ?? 0;
+    debugPrint('WM[barcode_uploader]: manifest PUT status=$manCode for job=${j.id}');
+    if (manCode != 200 && manCode != 201 && manCode != 204) {
+      if (_isPermanentPut(manCode)) throw PermanentFail('put_manifest:$manCode');
+      return false;
+    }
+
+    // ---- Notify AFTER manifest succeeds ----
+    try {
+      await http.post(
+        Uri.parse('$kApiBase/ack'),
+        headers: _auth('application/json', 'pods/$day/${(j.username ?? '').toLowerCase()}/${j.podNo}_1.jpg')
+          ..addAll({'x-driver': (j.username ?? '').toLowerCase()}),
+        body: jsonEncode({'podNo': j.podNo, 'day': day, 'username': (j.username ?? '').toLowerCase()}),
+      );
+    } catch (_) {}
+
+    try {
+      final anyKey = 'pods/$day/${(j.username ?? '').toLowerCase()}/${j.podNo}_1.jpg';
+      await http.post(
+        Uri.parse('$kApiBase/notify'),
+        headers: _auth('application/json', anyKey),
+        body: jsonEncode({
+          'content': '📦 DO: ${j.podNo}\n${j.isRejected ? '❌ Rejected' : '✅ Delivered'}\n🚚 ${(j.username ?? '').toLowerCase()}\n📅 ${j.rddDate}',
+          'imageUrls': urls,
+        }),
+      );
+    } catch (_) {}
+
+    return true;
+  } catch (e, st) {
+    debugPrint('UploadQueue _process error: $e\n$st');
+    if (e is PermanentFail) rethrow;
+    return false;
   }
+}
+
 
   Future<void> _saveJob(UploadJob j) async {
     final dir = Directory('${_root!.path}/${j.id}');
@@ -1615,6 +1597,7 @@ Future<void> _adminOpenUploadOnBehalf({
       day: day,
     );
     final token = (approve['token'] as String).trim();
+    await UploadQueue.instance.rememberSession(driverId: driverId, day: day, token: token);
 
     final podId    = _podIdFromRow(row);
     final customer = _customerFromRow(row);
@@ -2230,8 +2213,10 @@ Future<void> _confirmAndApproveForToday() async {
 
       // Save for this driver so the Driver screen unlocks without QR
       final sp = await SharedPreferences.getInstance();
-      await sp.setString('$kSpSessTokenPrefix${widget.driverId}', token);
-      await sp.setString('$kSpSessDayPrefix${widget.driverId}', day);
+
+      final u = widget.driverId.trim().toLowerCase();
+      await sp.setString('$kSpSessTokenPrefix$u', token);
+      await sp.setString('$kSpSessDayPrefix$u', day);
 
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -3249,11 +3234,10 @@ Future<bool> _hasAckOrManifestQuick(PodData pod) async {
 
   Future<void> _loadSessionForUser(String username) async {
   final sp = await SharedPreferences.getInstance();
-  final tok = sp.getString('$kSpSessTokenPrefix$username');
-  final day = sp.getString('$kSpSessDayPrefix$username');
+  final u = username.trim().toLowerCase();
+  final tok = sp.getString('$kSpSessTokenPrefix$u');
+  final day = sp.getString('$kSpSessDayPrefix$u');
   final today = _todayYMD();
-
-
 
   if (tok != null && day == today) {
     setState(() {
@@ -3426,7 +3410,122 @@ Future<void> loadSavedLogin() async {
   }
 }
 
+// --- MYT helpers (UTC+8) ---
+String _todayMYT() {
+  final mytNow = DateTime.now().toUtc().add(const Duration(hours: 8));
+  return DateFormat('yyyy-MM-dd').format(mytNow);
+}
+
+String _claimsUrlFor(String username, String day) {
+  final user = username.toLowerCase();
+  final cacheBust = DateTime.now().millisecondsSinceEpoch;
+  return '$kS3Base/claims/$day/$user.json?ts=$cacheBust';
+}
+
+// Fetch admin-minted claim from S3 once, then cache locally for this day
+Future<bool> _fetchClaimFromS3Once(String username) async {
+  final day = _todayMYT();
+  final user = username.toLowerCase();
+  final sp = await SharedPreferences.getInstance();
+
+  // Per-day cache key
+  final dailyKey = 'sess.token.$user.$day';
+  final existing = sp.getString(dailyKey);
+  if (existing != null && existing.isNotEmpty) {
+    setState(() {
+      sessionToken = existing;
+      sessionDay   = day;
+      loggedInUsername = user;
+    });
+    debugPrint('ENSURE -> per-day cache hit');
+
+    return true;
+  }
+
+  final url = _claimsUrlFor(user, day);
+  debugPrint('CLAIM URL => $url  (user=$user day=$day)');
+  try {
+    final res = await http.get(Uri.parse(url))
+    .timeout(const Duration(seconds: 5));
+
+    debugPrint('CLAIM GET status=${res.statusCode}');
+    if (res.statusCode != 200) {
+      debugPrint('claim GET ${res.statusCode} for $url');
+      return false; // 404 → not approved yet
+    }
+
+    final map = jsonDecode(utf8.decode(res.bodyBytes)) as Map<String, dynamic>;
+    final fileDay = (map['day'] as String).trim();
+    final tokenPreview = (map['token'] as String);
+    debugPrint('CLAIM JSON day=$fileDay token.len=${tokenPreview.length}');
+
+    final token = (map['token'] as String).trim();
+
+    // Cache under the day provided in the file (should equal _todayMYT)
+    await sp.setString('sess.token.$user.$fileDay', token);
+    await sp.setString('sess.token.$user', token); // legacy
+    await sp.setString('sess.day.$user', fileDay);
+    debugPrint('CACHED: sess.token.$user.$fileDay present=' + ((await sp.getString('sess.token.$user.$fileDay')) != null).toString());
+
+    if (fileDay == day) {
+      setState(() {
+        sessionToken = token;
+        sessionDay   = day;
+        loggedInUsername = user;
+      });
+      debugPrint('ENSURE -> per-day cache hit');
+
+      return true;
+    } else {
+      debugPrint('claim day mismatch: file=$fileDay app=$day');
+      return false;
+    }
+  } catch (e) {
+    debugPrint('claim fetch error: $e');
+    return false;
+  }
+}
+
+// Ensure we have today's session in memory, preferring per-day cache
+Future<void> _ensureSessionForToday(String username) async {
+  final user = username.toLowerCase();
+  final day  = _todayMYT();
+  final sp = await SharedPreferences.getInstance();
+  debugPrint('_ensureSessionForToday(user=$user day=$day)');
+
+  // 1) Per-day cached token
+  final perDay = sp.getString('sess.token.$user.$day');
+  if (perDay != null && perDay.isNotEmpty) {
+    setState(() {
+      sessionToken = perDay;
+      sessionDay   = day;
+      loggedInUsername = user;
+    });
+    debugPrint('ENSURE -> per-day cache hit');
+
+    return;
+  }
+
+  // 2) Legacy key if its day matches today
+  final t = sp.getString('sess.token.$user');
+  final d = sp.getString('sess.day.$user');
+  if (t != null && d == day) {
+    setState(() {
+      sessionToken = t;
+      sessionDay   = d;
+      loggedInUsername = user;
+    });
+    debugPrint('ENSURE -> legacy cache hit');
+    return;
+  }
+  debugPrint('ENSURE -> no local token, fetching from S3…');
+  // 3) Nothing local → fetch once from S3
+  await _fetchClaimFromS3Once(user);
+}
+
+
 Future<void> loadPodDataFromS3ForUser(String username) async {
+    await _ensureSessionForToday(username);
   setState(() {
     podDataList = [];
     podImages.clear();
@@ -3437,7 +3536,24 @@ Future<void> loadPodDataFromS3ForUser(String username) async {
   debugPrint('includeToday=$includeToday  sessionDay=$sessionDay  today=${_todayYMD()}');
 
   // 1) Load week rows from pointer (bundle) or fallback to per-day fetch
-final rows = await _loadWeekRows();
+var rows = await _loadWeekRows();
+  // If approved for today, overlay today's rows from the API (auth-only)
+  if (includeToday && sessionToken != null) {
+    try {
+      final uri = Uri.parse('$kApiBase/lists/today/${username.toLowerCase()}.json');
+      final res = await http.get(uri, headers: {'Authorization': 'Bearer $sessionToken'});
+      if (res.statusCode == 200) {
+        final todayRows = jsonDecode(utf8.decode(res.bodyBytes)) as List<dynamic>;
+        // Prepend so "newest wins" when we dedupe by POD later
+        rows = [...todayRows, ...rows];
+      } else {
+        debugPrint('today list api ${res.statusCode}: ${res.body}');
+      }
+    } catch (e) {
+      debugPrint('today list api error: $e');
+    }
+  }
+
 if (rows.isEmpty) {
   if (mounted) {
     ScaffoldMessenger.of(context).showSnackBar(
@@ -3753,9 +3869,9 @@ List<Object> _groupedItemsByDayFiltered(List<PodData> items, String query) {
       return LoginPage(
         onLoginSuccess: (username) async {
           final prefs = await SharedPreferences.getInstance();
-          await prefs.setString('loggedInUsername', username);
-
-          setState(() => loggedInUsername = username);
+          final u = username.trim().toLowerCase();
+          await prefs.setString('loggedInUsername', u);
+          setState(() => loggedInUsername = u);
 
           // hydrate session (if admin already approved on this device)
           await _loadSessionForUser(username);
@@ -3812,8 +3928,11 @@ List<Object> _groupedItemsByDayFiltered(List<PodData> items, String query) {
                     // Persist for this driver so app stays unlocked for today
                     final sp = await SharedPreferences.getInstance();
                     if (loggedInUsername != null) {
-                      await sp.setString('$kSpSessTokenPrefix${loggedInUsername!}', t);
-                      await sp.setString('$kSpSessDayPrefix${loggedInUsername!}', d);
+                      final u = loggedInUsername!.trim().toLowerCase();
+                      await sp.setString('$kSpSessTokenPrefix$u', t);
+                      await sp.setString('$kSpSessDayPrefix$u', d);
+                      await sp.setString('sess.token.$u.$d', t); // per-day cache for today
+
                     }
                     await loadPodDataFromS3ForUser(loggedInUsername!);
                     if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('✅ Today unlocked')));
@@ -3836,8 +3955,11 @@ List<Object> _groupedItemsByDayFiltered(List<PodData> items, String query) {
                     // Persist for this driver so app stays unlocked for today
                     final sp = await SharedPreferences.getInstance();
                     if (loggedInUsername != null) {
-                      await sp.setString('$kSpSessTokenPrefix${loggedInUsername!}', t);
-                      await sp.setString('$kSpSessDayPrefix${loggedInUsername!}', d);
+                      final u = loggedInUsername!.trim().toLowerCase();
+                      await sp.setString('$kSpSessTokenPrefix$u', t);
+                      await sp.setString('$kSpSessDayPrefix$u', d);
+                      await sp.setString('sess.token.$u.$d', t); // per-day cache for today
+
                     }
                     await loadPodDataFromS3ForUser(loggedInUsername!);
                     if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('✅ Today unlocked')));
@@ -4077,6 +4199,18 @@ List<Object> _groupedItemsByDayFiltered(List<PodData> items, String query) {
           children: [
             // Today locked banner (shows until a valid sessionToken for today's day exists)
             if (!(sessionToken != null && sessionDay == _todayYMD())) ...[
+                Builder(
+                  builder: (_) {
+                    debugPrint(
+                      'BANNER LOCKED because '
+                      'sessionToken=${sessionToken == null ? 'null' : 'set'} '
+                      'sessionDay=$sessionDay '
+                      'today=${_todayYMD()}',
+                    );
+                    return const SizedBox.shrink();
+                  },
+                ),
+
               Container(
                 padding: const EdgeInsets.all(12),
                 decoration: BoxDecoration(
@@ -4110,6 +4244,7 @@ List<Object> _groupedItemsByDayFiltered(List<PodData> items, String query) {
                 ),
               ),
               const SizedBox(height: 16),
+              
             ],
               // --- Search bar (POD No or Customer) ---
             TextField(
@@ -4135,17 +4270,35 @@ List<Object> _groupedItemsByDayFiltered(List<PodData> items, String query) {
             const SizedBox(height: 12),
             Expanded(
               child: RefreshIndicator(
-                  onRefresh: () async {
-                    // Always rescan the on-disk queue first
-                    await UploadQueue.instance.rescanFromDisk();
+                onRefresh: () async {
+                  // Always rescan jobs from disk (local-only, fast)
+                  await UploadQueue.instance.rescanFromDisk();
 
-                    if (loggedInUsername != null) {
-                      await _tryAutoClaimToday();
-                      await loadPodDataFromS3ForUser(loggedInUsername!);
-                    } else {
-                      await _hydrateFromS3Manifests();
-                    }
-                  },
+                  // Try to unlock today quickly, but don't hang forever
+                  if (loggedInUsername != null) {
+                    try {
+                      await _tryAutoClaimToday()
+                          .timeout(const Duration(seconds: 3), onTimeout: () => null);
+                    } catch (_) {/* best-effort */}
+                    // Kick off the list fetch in the background so UI doesn't wait
+                    Future.microtask(() async {
+                      try {
+                        await loadPodDataFromS3ForUser(loggedInUsername!);
+                      } catch (_) {/* ignore */}
+                    });
+                  } else {
+                    // Also background if no user selected
+                    Future.microtask(() async {
+                      try {
+                        await _hydrateFromS3Manifests();
+                      } catch (_) {/* ignore */}
+                    });
+                  }
+
+                  // <-- IMPORTANT: end the refresh *now*. UI stops spinning immediately.
+                  return;
+                },
+
                   child: ListView.builder(
                     physics: const AlwaysScrollableScrollPhysics(),
                     itemCount: _groupedItemsByDayFiltered(podDataList, _search).length,
