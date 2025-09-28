@@ -22,7 +22,6 @@ import 'package:package_info_plus/package_info_plus.dart';
 import 'ios_bg_upload.dart';
 
 
-/// WorkManager background entrypoint — must be a TOP-LEVEL function.
 @pragma('vm:entry-point')
 void uploadCallbackDispatcher() {
   Workmanager().executeTask((task, inputData) async {
@@ -30,53 +29,29 @@ void uploadCallbackDispatcher() {
 
     await UploadQueue.instance.init();
     await UploadQueue.instance.rescanFromDisk();
-        // ===== B) RESTORE SESSION FOR BACKGROUND ISOLATE (ADD THIS) =====
-    // Make sure you have:  import 'package:shared_preferences/shared_preferences.dart';
-    final prefs   = await SharedPreferences.getInstance();
-    final driver  = prefs.getString('session.driverId');
-    final day     = prefs.getString('session.day');
-    final token   = prefs.getString('session.token');
 
-    if (driver != null && day != null && token != null) {
-      // If you already have a setter on your queue, use it:
-      UploadQueue.instance.setSession(
-        driverId: driver,
-        day: day,
-        token: token,
-      );
-      debugPrint('WM[barcode_uploader]: restored session driver=$driver day=$day');
-    } else {
-      debugPrint('WM[barcode_uploader]: no saved session -> may hit no_session_for_day');
-    }
-    // ===== END B) =====
     try {
-      final dir = Directory('${(await getApplicationDocumentsDirectory()).path}/upload_queue');
-      final list = await dir.list(recursive: true).toList();
-      debugPrint('WM[barcode_uploader]: queue dir=${dir.path} files=${list.length}');
-      for (final e in list.take(10)) {
-        debugPrint('WM[barcode_uploader]: qfile ${e.path}');
-      }
-    } catch (e) {
-      debugPrint('WM[barcode_uploader]: queue list error $e');
+      final ok = await UploadQueue.instance.drain();
+
+      await UploadNotifications.update(
+        hasJobs: UploadQueue.instance.hasJobs,
+        jobCount: UploadQueue.instance.jobCount,
+      );
+
+      debugPrint(
+        'WM[barcode_uploader]: dispatcher done (success=$ok remaining=${UploadQueue.instance.jobCount})'
+      );
+      return ok; // <-- single return here
+    } catch (e, st) {
+      debugPrint('WM[barcode_uploader]: dispatcher error: $e\n$st');
+      try {
+        await UploadNotifications.update(
+          hasJobs: UploadQueue.instance.hasJobs,
+          jobCount: UploadQueue.instance.jobCount,
+        );
+      } catch (_) {}
+      return false;
     }
-
-    debugPrint(
-      'WM[barcode_uploader]: dispatcher start task=$task data=$inputData '
-      'hasJobs=${UploadQueue.instance.hasJobs} count=${UploadQueue.instance.jobCount}'
-    );
-    debugPrint('DEBUG4 WM hasJobs=${UploadQueue.instance.hasJobs} count=${UploadQueue.instance.jobCount}');
-
-    final ok = await UploadQueue.instance.drain();
-
-    await UploadNotifications.update(
-      hasJobs: UploadQueue.instance.hasJobs,
-      jobCount: UploadQueue.instance.jobCount,
-    );
-
-    debugPrint(
-      'WM[barcode_uploader]: dispatcher done (success=$ok remaining=${UploadQueue.instance.jobCount})'
-    );
-    return ok; // <- this is the bool you got from drain()
   });
 }
 
@@ -334,6 +309,10 @@ class UploadQueue {
   String? _sessionDay;
   String? _sessionToken;
 
+  // If true on iOS, do direct PUTs now (foreground), skip background URLSession.
+  // We'll reset this to false after drain() finishes.
+  static bool forceDirectIOSPut = false;
+
   void setSession({
     required String token,
     required String day,
@@ -342,31 +321,6 @@ class UploadQueue {
     _sessionToken   = token;
     _sessionDay     = day;
     _sessionDriverId= driverId;
-  }
-
-  String _publicUrlFromSigned(String signed) {
-    final uri = Uri.parse(signed);
-    var segs = List.of(uri.pathSegments);
-    if (segs.isNotEmpty && segs.first == 'hm-epod') segs = segs.sublist(1);
-    return '$_bucketBase/${segs.join('/')}';
-  }
-
-  // Poll S3 (HEAD) until the object exists, so embeds can fetch it.
-  Future<bool> _waitForS3(String url, {int timeoutSec = 45}) async {
-    final started = DateTime.now();
-    var delay = const Duration(milliseconds: 400); // backoff: 0.4s → 3s
-    while (DateTime.now().difference(started).inSeconds < timeoutSec) {
-      try {
-        final res = await http.head(Uri.parse(url));
-        if (res.statusCode == 200) return true;
-        // 403/404 → not there yet; keep waiting
-      } catch (_) {}
-      await Future.delayed(delay);
-      delay *= 2;
-      if (delay > const Duration(seconds: 3)) delay = const Duration(seconds: 3);
-    }
-    debugPrint('WM[barcode_uploader]: timeout waiting for S3: $url');
-    return false;
   }
 
   // Expose the internal pump as a public method for WorkManager isolate.
@@ -426,6 +380,34 @@ class UploadQueue {
     receiveTimeout: const Duration(minutes: 10),
     sendTimeout: const Duration(minutes: 10),
   ));
+
+    // === Public URL from a presigned PUT URL ===
+  String _publicUrlFromSigned(String signed) {
+    final uri = Uri.parse(signed);
+    var segs = List.of(uri.pathSegments);
+    if (segs.isNotEmpty && segs.first == 'hm-epod') segs = segs.sublist(1);
+    return '$_bucketBase/${segs.join('/')}';
+  }
+
+  // === Wait until S3 starts serving the object (HEAD 200) ===
+  Future<bool> _waitForS3(String url, {int timeoutSec = 60}) async {
+    final deadline = DateTime.now().add(Duration(seconds: timeoutSec));
+    var delayMs = 500;
+    while (DateTime.now().isBefore(deadline)) {
+      try {
+        final resp = await _dio.head(
+          url,
+          options: Options(followRedirects: false, validateStatus: (_) => true),
+        );
+        final code = resp.statusCode ?? 0;
+        if (code == 200) return true;
+      } catch (_) {}
+      await Future.delayed(Duration(milliseconds: delayMs));
+      if (delayMs < 4000) delayMs *= 2;
+    }
+    return false;
+  }
+
 
   final _events = StreamController<QueueEvent>.broadcast();
   Stream<QueueEvent> get events => _events.stream;
@@ -726,6 +708,13 @@ Future<bool> _process(UploadJob j) async {
 
     final urls = <String>[];
 
+    // If iOS and app is in foreground (or explicitly forced), do direct PUTs.
+    // Otherwise (iOS background), use background URLSession.
+    final bool preferDirectPut =
+        !Platform.isIOS ? true : (_AppLifecycle.isForeground || UploadQueue.forceDirectIOSPut);
+
+    bool anyBackgroundStarted = false;
+
     // ---- Upload each image ----
     for (var i = 0; i < j.imagePaths.length; i++) {
       final key = 'pods/$day/${(j.username ?? '').toLowerCase()}/${j.podNo}_${i + 1}.jpg';
@@ -761,44 +750,58 @@ Future<bool> _process(UploadJob j) async {
       }
 
       debugPrint('WM[barcode_uploader]: PUT start job=${j.id} file=$imgPath');
-      if (Platform.isIOS) {
-  // iOS: start the background upload…
+// --- PUT strategy: iOS background vs direct ---
+if (Platform.isIOS && !preferDirectPut) {
   final started = await IOSBgUpload.start(
     filePath: imgPath,
     presignedUrl: signed,
     headers: {'Content-Type': 'image/jpeg'},
     method: 'PUT',
   );
-  if (!started) {
-    // Couldn’t start; let WorkManager retry later.
-    return false;
+  if (started) {
+    anyBackgroundStarted = true;
+    debugPrint('WM[barcode_uploader]: iOS background PUT started for $imgPath');
+    // Pre-compute the final public URL; manifest will be posted later.
+    // iOS: wait until S3 serves the object so Discord can fetch it
+    final pubUrl = _publicUrlFromSigned(signed);
+    final ok = await _waitForS3(pubUrl, timeoutSec: 60);
+    if (!ok) {
+      // Not visible yet → let WorkManager retry a bit later
+      return false;
+    }
+    urls.add(pubUrl);
+    continue; // proceed to manifest + notify
   }
-
-  // …then WAIT until S3 returns 200 so Discord can fetch it.
-  final pubUrl = _publicUrlFromSigned(signed);
-  final ok = await _waitForS3(pubUrl, timeoutSec: 60);
-  if (!ok) return false; // not visible yet → retry later
-
-  urls.add(pubUrl);
-} else {
-  // Android: do the normal awaited PUT
-  final put = await _dio.put(
-    signed,
-    data: await imgFile.readAsBytes(),
-    options: Options(
-      headers: {'Content-Type': 'image/jpeg'},
-      followRedirects: false,
-      validateStatus: (_) => true,
-    ),
-  );
-  debugPrint('WM[barcode_uploader]: PUT done job=${j.id} status=${put.statusCode}');
-  final code = put.statusCode ?? 0;
-  if (code != 200 && code != 201 && code != 204) return false;
-
-  urls.add(_publicUrlFromSigned(signed));
+  debugPrint('WM[barcode_uploader]: iOS background PUT could not start, falling back to direct PUT');
 }
 
+// Foreground/direct PUT (Android always; iOS when app is open OR bg start failed)
+final put = await _dio.put(
+  signed,
+  data: await imgFile.readAsBytes(),
+  options: Options(
+    headers: {'Content-Type': 'image/jpeg'},
+    followRedirects: false,
+    validateStatus: (_) => true,
+  ),
+);
+debugPrint('WM[barcode_uploader]: PUT done job=${j.id} status=${put.statusCode}');
+final putCode = put.statusCode ?? 0;
+if (putCode != 200 && putCode != 201 && putCode != 204) {
+  // All PUT failures are retryable in your code.
+  return false;
+}
+
+
     }
+
+    // If any iOS background uploads were started, DO NOT post the manifest/discord yet.
+    // Let WorkManager/URLSession wake us later; then this method will run again and complete.
+    if (Platform.isIOS && !preferDirectPut && anyBackgroundStarted) {
+      debugPrint('WM[barcode_uploader]: iOS background started; deferring manifest/notify');
+      return false; // signals "retry later"
+    }
+
 
     // ---- Manifest (status + urls) ----
     final manifestKey = 'pods/$day/${(j.username ?? '').toLowerCase()}/${j.podNo}_meta.json';
@@ -904,8 +907,21 @@ class UploadResult {
   UploadResult(this.urls, this.status, {this.localFiles});
 }
 
+// --- Foreground/Background detector (iOS needs this) ---
+class _AppLifecycle with WidgetsBindingObserver {
+  static bool isForeground = true;
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    isForeground = (state == AppLifecycleState.resumed);
+  }
+}
+
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  WidgetsBinding.instance.addObserver(_AppLifecycle());
 
   await _requestAndroidPostNotifications();
 
@@ -928,36 +944,22 @@ Future<void> main() async {
 // --- iOS: listen for background URLSession completions and run finalize + Discord ---
 if (Platform.isIOS) {
   IOSBgUpload.onCompleted.listen((e) async {
-    // Payload from iOS (BackgroundUploader.swift):
-    // { ok: bool, status: int, taskId: int, filePath: String, url: String, error?: String }
-    final ok = (e['ok'] as bool?) ?? false;
-    final status = e['status']?.toString() ?? '?'; // keep as String (your preference)
+    final ok       = (e['ok'] as bool?) ?? false;
+    final status   = e['status']?.toString() ?? '?';
     final filePath = (e['filePath'] as String?) ?? '';
     final baseName = filePath.split('/').isNotEmpty ? filePath.split('/').last : filePath;
+    debugPrint('[iOS bg] completed: ok=$ok status=$status file=$baseName');
 
     try {
-      // ===== REQUIRED: call your existing "finalize + Discord" helper here =====
-      // UNCOMMENT the next line and replace the function name/params with yours.
-      // await finalizeAndNotifyDiscord(
-      //   filePath: filePath,
-      //   httpStatus: int.tryParse(status) ?? -1,
-      // );
-
-      // ===== OPTIONAL: extra short note like "<filename> upload complete (iOS)" =====
-      // UNCOMMENT this block if your helper supports an extra message field.
-      // await finalizeAndNotifyDiscord(
-      //   filePath: filePath,
-      //   httpStatus: int.tryParse(status) ?? -1,
-      //   extraMessage: '$baseName upload complete (iOS)',
-      // );
-
-      // If you haven't wired the helper yet, at least keep a log:
-      // debugPrint('[iOS bg] completed: ok=$ok status=$status file=$filePath');
+      // Re-scan the queue and try to finish the job (manifest + Discord).
+      await UploadQueue.instance.rescanFromDisk();
+      final done = await UploadQueue.instance.drain();
+      debugPrint('[iOS bg] finalize drain ok=$done for $baseName');
     } catch (err) {
-      // 🔧 Keep this log uncommented for visibility when something goes wrong.
-      debugPrint('iOS bg finalize/notify error: $err (file=$filePath, status=$status)');
+      debugPrint('iOS bg finalize/notify error: $err (file=$baseName, status=$status)');
     }
   });
+
 }
 
 
