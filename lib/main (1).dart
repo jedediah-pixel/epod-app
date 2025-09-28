@@ -4832,18 +4832,19 @@ Future<void> uploadImagesToS3() async {
 
   await UploadQueue.instance.enqueue(job);
 
-// --- 3b: kick the queue, don't wait here ---
-// If we *do* have a JWT for the same day, pass it in; otherwise device-auth will kick in.
-if (widget.sessionToken != null && widget.sessionDay != null) {
-  UploadQueue.instance.setSession(
-    token: widget.sessionToken!,
-    day: widget.sessionDay!,
-    driverId: widget.username.toLowerCase(),
-  );
-}
-// Do NOT await; let the queue run in background so we can pop immediately.
-unawaited(UploadQueue.instance.drain());
-// --- end 3b ---
+  // --- 3b: kick the queue, don't wait here ---
+  // If you *do* have a JWT, pass it to the queue; otherwise device-auth will kick in.
+  if (widget.sessionToken != null && widget.sessionDay != null) {
+    UploadQueue.instance.setSession(
+      token: widget.sessionToken!,
+      day: widget.sessionDay!,
+      driverId: widget.username.toLowerCase(),
+    );
+  }
+  // Do NOT await; let the queue run in background.
+  unawaited(UploadQueue.instance.drain());
+  // --- end 3b ---
+
 
   if (!mounted) return;
   ScaffoldMessenger.of(context).showSnackBar(
