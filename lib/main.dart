@@ -28,19 +28,29 @@ void uploadCallbackDispatcher() {
   Workmanager().executeTask((task, inputData) async {
     WidgetsFlutterBinding.ensureInitialized();
 
-    await UploadQueue.instance.init();
-    await UploadQueue.instance.rescanFromDisk();
+    // ---- BEGIN HEADLESS GUARD ----
+    UploadQueue.isHeadless = true;
+    try {
+      await UploadQueue.instance.init();           // init will skip connectivity stream in headless
+      await UploadQueue.instance.rescanFromDisk();
 
-    final ok = await UploadQueue.instance.drain();
+      final ok = await UploadQueue.instance.drain();
 
-    await UploadNotifications.update(
-      hasJobs: UploadQueue.instance.hasJobs,
-      jobCount: UploadQueue.instance.jobCount,
-    );
+      await UploadNotifications.update(
+        hasJobs: UploadQueue.instance.hasJobs,
+        jobCount: UploadQueue.instance.jobCount,
+      );
 
-    return ok;
+      return ok;
+    } finally {
+      // Always tear down any connectivity listener in the worker isolate
+      await UploadQueue.instance.cancelConnectivityStream();
+      UploadQueue.isHeadless = false;
+    }
+    // ---- END HEADLESS GUARD ----
   });
 }
+
 
 
 Future<void> _requestAndroidPostNotifications() async {
@@ -299,10 +309,21 @@ class UploadQueue {
   String? _sessionDriverId;
   String? _sessionDay;
   String? _sessionToken;
+  String? _processingId;
 
   // If true on iOS, do direct PUTs now (foreground), skip background URLSession.
   // We'll reset this to false after drain() finishes.
   static bool forceDirectIOSPut = false; // iOS: true = foreground (direct PUT), false = background URLSession
+  static bool isHeadless = false; // background isolate signal
+  StreamSubscription<List<ConnectivityResult>>? _connSub;
+
+  Future<void> cancelConnectivityStream() async {
+  try {
+    await _connSub?.cancel();
+  } catch (_) {}
+  _connSub = null;
+}
+
 
   void setSession({
     required String token,
@@ -414,7 +435,6 @@ class UploadQueue {
   final _jobs = <UploadJob>[];
   bool get hasJobs => _jobs.isNotEmpty;
   int  get jobCount => _jobs.length; // optional, handy for debugging
-  StreamSubscription? _connSub;
 
   Future<void> init() async {
     if (_root == null) {
@@ -422,9 +442,13 @@ class UploadQueue {
       _root = Directory('${docs.path}/upload_queue');
       if (!await _root!.exists()) await _root!.create(recursive: true);
       await _loadJobsFromDisk();
-      _connSub = Connectivity().onConnectivityChanged.listen((_) {
-        if (_jobs.isNotEmpty) _start();
-      });
+      if (!UploadQueue.isHeadless) {
+        await _connSub?.cancel();
+        _connSub = Connectivity().onConnectivityChanged.listen((List<ConnectivityResult> _) {
+      if (_jobs.isNotEmpty) _start();
+    });
+      }
+
     }
     if (_jobs.isNotEmpty) _start();
   }
@@ -435,17 +459,26 @@ class UploadQueue {
   }
 
   Future<void> enqueue(UploadJob job) async {
-    // De-dup: if a job exists for the same (user, day, POD), replace it.
+    // De-dup: be careful not to delete the one currently being processed.
     final _k = _jobKey(job);
     final i = _jobs.indexWhere((x) => _jobKey(x) == _k);
     if (i >= 0) {
-      // remove old job folder so we don't leave stale files
       final old = _jobs[i];
-      final oldDir = Directory('${_root!.path}/${old.id}');
-      if (await oldDir.exists()) {
-        try { await oldDir.delete(recursive: true); } catch (_) {}
+      final inFlight = (i == 0 && _processingId == old.id);
+
+      if (!inFlight) {
+        // Safe to replace: drop old entry and delete its folder
+        _jobs.removeAt(i);
+        final oldDir = Directory('${_root!.path}/${old.id}');
+        if (await oldDir.exists()) {
+          try { await oldDir.delete(recursive: true); } catch (_) {}
+        }
+      } else {
+        // Old job is the one uploading right now.
+        // Ignore this new reupload to avoid duplicate jobs with missing files.
+        return;
       }
-      _jobs.removeAt(i);
+
     }
 
     final dir = Directory('${_root!.path}/${job.id}');
@@ -546,12 +579,17 @@ Future<int> deleteQueueCopiesForPod({
   Future<void> _pump() async {
     while (_jobs.isNotEmpty) {
       final job = _jobs.first;
+      _processingId = job.id;
 
       // Hard cap
       if (job.attempts >= kMaxAttempts) {
         _events.add(QueueEvent(job.id, job.podNo, false, const []));
         await _deleteJobFiles(job);          // drop the stuck job
-        _jobs.removeAt(0);
+        final idx = (_jobs.isNotEmpty && _jobs.first.id == job.id)
+    ? 0
+    : _jobs.indexWhere((x) => x.id == job.id);
+if (idx >= 0) _jobs.removeAt(idx);
+
         UploadNotifications.update(hasJobs: hasJobs, jobCount: jobCount);
         continue;                            // move to next job
       }
@@ -560,20 +598,26 @@ Future<int> deleteQueueCopiesForPod({
       bool permanent = false;
 
       try {
-        ok = await _process(job);               // success = true
+        ok = await _process(job);
       } on PermanentFail catch (e) {
         permanent = true;
         debugPrint('Upload permanent fail: ${e.reason}');
       } catch (e, st) {
-        // transient or unexpected — fall through to retry path
+
         debugPrint('Upload transient/unknown error: $e\n$st');
         ok = false;
+      } finally {
+        _processingId = null; // always clear when done with this job
       }
 
       if (ok) {
         _events.add(QueueEvent(job.id, job.podNo, true, await _deriveUrls(job)));
         await _deleteJobFiles(job);
-        _jobs.removeAt(0);
+        final idx = (_jobs.isNotEmpty && _jobs.first.id == job.id)
+    ? 0
+    : _jobs.indexWhere((x) => x.id == job.id);
+if (idx >= 0) _jobs.removeAt(idx);
+
         UploadNotifications.update(hasJobs: hasJobs, jobCount: jobCount);
         continue;
       }
@@ -582,7 +626,11 @@ Future<int> deleteQueueCopiesForPod({
         // stop retrying this job
         _events.add(QueueEvent(job.id, job.podNo, false, const []));
         await _deleteJobFiles(job);
-        _jobs.removeAt(0);
+        final idx = (_jobs.isNotEmpty && _jobs.first.id == job.id)
+    ? 0
+    : _jobs.indexWhere((x) => x.id == job.id);
+if (idx >= 0) _jobs.removeAt(idx);
+
         UploadNotifications.update(hasJobs: hasJobs, jobCount: jobCount);
         continue;
       }
@@ -593,7 +641,11 @@ Future<int> deleteQueueCopiesForPod({
         _events.add(QueueEvent(job.id, job.podNo, false, const []));
         await _saveJob(job);
         await _deleteJobFiles(job);
-        _jobs.removeAt(0);
+        final idx = (_jobs.isNotEmpty && _jobs.first.id == job.id)
+    ? 0
+    : _jobs.indexWhere((x) => x.id == job.id);
+if (idx >= 0) _jobs.removeAt(idx);
+
         UploadNotifications.update(hasJobs: hasJobs, jobCount: jobCount);
         continue;
       }
@@ -869,11 +921,10 @@ Future<bool> _process(UploadJob j) async {
       // 2) PUT to S3
       final imgPath = j.imagePaths[i];
       final imgFile = File(imgPath);
-      if (!await imgFile.exists()) {
-        debugPrint('WM[barcode_uploader]: missing image; skip job=${j.id} path=$imgPath');
-        await rescanFromDisk();
-        throw Exception('image missing');
-      }
+    if (!await imgFile.exists()) {
+      debugPrint('WM[barcode_uploader]: missing image; drop job=${j.id} path=$imgPath');
+      throw PermanentFail('image_missing'); // <- permanent, no rescan here
+    }
 
       debugPrint('WM[barcode_uploader]: PUT start job=${j.id} file=$imgPath');
 // --- PUT strategy: iOS background vs direct ---
@@ -1034,6 +1085,8 @@ try {
 
   // (Optional but useful for future dedupe) include a stable job id
   notifyHeaders['x-job-id'] = j.id;  // uncomment if you also add server-side dedupe
+  notifyHeaders['x-notify-force'] = '1';
+
 
   final notifyResp = await http.post(
     Uri.parse(usedDeviceAuth ? '$kApiBase/notify_device' : '$kApiBase/notify'),
