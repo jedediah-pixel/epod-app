@@ -312,6 +312,8 @@ class UploadQueue {
   String? _processingId;
   // Tracks one active/pending job per (day|user|pod)
   final Set<String> _inflightKeys = <String>{};
+  // key: username|YYYY-MM-DD|POD → latest replacement job
+  final Map<String, UploadJob> _supersede = {};
 
   // If true on iOS, do direct PUTs now (foreground), skip background URLSession.
   // We'll reset this to false after drain() finishes.
@@ -461,38 +463,49 @@ class UploadQueue {
   }
 
 Future<void> enqueue(UploadJob job) async {
-  final dupKey = _jobKey(job);
+final key = _jobKey(job);
 
-  // If already in-flight, ignore
-  if (_inflightKeys.contains(dupKey)) {
-    debugPrint('WM[barcode_uploader]: duplicate enqueue ignored for $dupKey (in-flight)');
+// If the exact same key is currently processing, defer as supersede.
+if (_processingId != null) {
+  final inProc = _jobs.isNotEmpty ? _jobs.first : null; // first = being processed in _pump
+  if (inProc != null && _jobKey(inProc) == key) {
+    _supersede[key] = job; // remember the latest
+    debugPrint('queue: supersede scheduled for $key (currently processing)');
     return;
   }
+}
 
-  // Already queued in memory?
-  final int i = _jobs.indexWhere((x) => _jobKey(x) == dupKey);
-  if (i >= 0) {
-    debugPrint('WM[barcode_uploader]: duplicate enqueue ignored for $dupKey (already in _jobs)');
-    return;
-  }
+  // If a queued (not processing) job with same key exists → replace it.
+final idx = _jobs.indexWhere((x) => _jobKey(x) == key);
+if (idx >= 0) {
+  final old = _jobs[idx];
+  await _deleteJobFiles(old); // remove old queue folder
+  _jobs.removeAt(idx);
+  _inflightKeys.remove(key);
+  debugPrint('queue: replaced queued job for $key');
+}
 
-  // Already queued on disk? (prevents race with background isolate)
+
+else {
+  // Also scan disk and delete if present (race-safe)
   final dirs = _root!.listSync().whereType<Directory>();
   for (final d in dirs) {
     final f = File('${d.path}/job.json');
     if (await f.exists()) {
       try {
         final existing = UploadJob.fromJson(jsonDecode(await f.readAsString()));
-        if (_jobKey(existing) == dupKey) {
-          debugPrint('WM[barcode_uploader]: duplicate enqueue ignored for $dupKey (found existing folder)');
-          return;
+        if (_jobKey(existing) == key) {
+          await Directory(d.path).delete(recursive: true);
+          _inflightKeys.remove(key);
+          debugPrint('queue: replaced on-disk job for $key');
         }
-      } catch (_) {/* ignore bad job */}
+      } catch (_) {}
     }
   }
+}
 
   // Passed all duplicate checks — mark as in-flight now
-  _inflightKeys.add(dupKey);
+  _inflightKeys.add(key);
   try {
     final dir = Directory('${_root!.path}/${job.id}');
     if (!await dir.exists()) await dir.create(recursive: true);
@@ -534,7 +547,7 @@ Future<void> enqueue(UploadJob job) async {
     }
   } catch (e) {
     // If enqueue fails before the job is persisted, release the in-flight key
-    _inflightKeys.remove(dupKey);
+    _inflightKeys.remove(key);
     rethrow;
   }
 }
@@ -670,6 +683,14 @@ Future<int> deleteQueueCopiesForPod({
 if (idx >= 0) _jobs.removeAt(idx);
 
         UploadNotifications.update(hasJobs: hasJobs, jobCount: jobCount);
+        // supersede: if a replacement was scheduled for this key, enqueue it now
+        final finishedKey = _jobKey(job);
+        final replacement = _supersede.remove(finishedKey);
+        if (replacement != null) {
+          debugPrint('queue: enqueuing supersede for $finishedKey');
+          await enqueue(replacement);
+        }
+
         continue;                            // move to next job
       }
 
@@ -713,6 +734,14 @@ if (idx >= 0) _jobs.removeAt(idx);
 if (idx >= 0) _jobs.removeAt(idx);
 
         UploadNotifications.update(hasJobs: hasJobs, jobCount: jobCount);
+        // supersede: if a replacement was scheduled for this key, enqueue it now
+final finishedKey = _jobKey(job);
+final replacement = _supersede.remove(finishedKey);
+if (replacement != null) {
+  debugPrint('queue: enqueuing supersede for $finishedKey');
+  await enqueue(replacement);
+}
+
         continue;
       }
 
@@ -729,6 +758,14 @@ if (idx >= 0) _jobs.removeAt(idx);
         if (idx >= 0) _jobs.removeAt(idx);
 
         UploadNotifications.update(hasJobs: hasJobs, jobCount: jobCount);
+        // supersede: if a replacement was scheduled for this key, enqueue it now
+final finishedKey = _jobKey(job);
+final replacement = _supersede.remove(finishedKey);
+if (replacement != null) {
+  debugPrint('queue: enqueuing supersede for $finishedKey');
+  await enqueue(replacement);
+}
+
         continue;
       }
 
@@ -1115,6 +1152,7 @@ urls.add(_publicUrlFromSigned(signed));
         'urls': urls,
         'updatedBy': (j.username ?? '').toLowerCase(),
         'updatedAt': DateTime.now().toIso8601String(),
+        'uploadId' : j.id,
       })),
       options: Options(headers: {'Content-Type': 'application/json'}),
     );
@@ -1167,11 +1205,7 @@ try {
 
   // (Optional but useful for future dedupe) include a stable job id
   notifyHeaders['x-job-id'] = j.id;  // uncomment if you also add server-side dedupe
-  final content =
-    '📦 DO: ${j.podNo}\n${j.isRejected ? '❌ Rejected' : '✅ Delivered'}'
-    '\n🚚 $uLower\n📅 ${j.rddDate}';
-debugPrint('NOTIFY content =>\n$content');
-
+  
   
   final notifyResp = await http.post(
     Uri.parse(usedDeviceAuth ? '$kApiBase/notify_device' : '$kApiBase/notify'),
