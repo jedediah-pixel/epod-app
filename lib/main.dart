@@ -310,6 +310,8 @@ class UploadQueue {
   String? _sessionDay;
   String? _sessionToken;
   String? _processingId;
+  // Tracks one active/pending job per (day|user|pod)
+  final Set<String> _inflightKeys = <String>{};
 
   // If true on iOS, do direct PUTs now (foreground), skip background URLSession.
   // We'll reset this to false after drain() finishes.
@@ -458,29 +460,40 @@ class UploadQueue {
     await _events.close();
   }
 
-  Future<void> enqueue(UploadJob job) async {
-    // De-dup: be careful not to delete the one currently being processed.
-    final _k = _jobKey(job);
-    final i = _jobs.indexWhere((x) => _jobKey(x) == _k);
-    if (i >= 0) {
-      final old = _jobs[i];
-      final inFlight = (i == 0 && _processingId == old.id);
+Future<void> enqueue(UploadJob job) async {
+  final dupKey = _jobKey(job);
 
-      if (!inFlight) {
-        // Safe to replace: drop old entry and delete its folder
-        _jobs.removeAt(i);
-        final oldDir = Directory('${_root!.path}/${old.id}');
-        if (await oldDir.exists()) {
-          try { await oldDir.delete(recursive: true); } catch (_) {}
+  // If already in-flight, ignore
+  if (_inflightKeys.contains(dupKey)) {
+    debugPrint('WM[barcode_uploader]: duplicate enqueue ignored for $dupKey (in-flight)');
+    return;
+  }
+
+  // Already queued in memory?
+  final int i = _jobs.indexWhere((x) => _jobKey(x) == dupKey);
+  if (i >= 0) {
+    debugPrint('WM[barcode_uploader]: duplicate enqueue ignored for $dupKey (already in _jobs)');
+    return;
+  }
+
+  // Already queued on disk? (prevents race with background isolate)
+  final dirs = _root!.listSync().whereType<Directory>();
+  for (final d in dirs) {
+    final f = File('${d.path}/job.json');
+    if (await f.exists()) {
+      try {
+        final existing = UploadJob.fromJson(jsonDecode(await f.readAsString()));
+        if (_jobKey(existing) == dupKey) {
+          debugPrint('WM[barcode_uploader]: duplicate enqueue ignored for $dupKey (found existing folder)');
+          return;
         }
-      } else {
-        // Old job is the one uploading right now.
-        // Ignore this new reupload to avoid duplicate jobs with missing files.
-        return;
-      }
-
+      } catch (_) {/* ignore bad job */}
     }
+  }
 
+  // Passed all duplicate checks — mark as in-flight now
+  _inflightKeys.add(dupKey);
+  try {
     final dir = Directory('${_root!.path}/${job.id}');
     if (!await dir.exists()) await dir.create(recursive: true);
 
@@ -499,48 +512,113 @@ class UploadQueue {
     _jobs.add(UploadJob.fromJson(save));
     UploadNotifications.update(hasJobs: hasJobs, jobCount: jobCount);
 
-      // Schedule/keep a single "drain the queue" job on Android
-      if (Platform.isAndroid) {
-        debugPrint('WM[barcode_uploader]: registering drain_uploads (reason=new_job_enqueued)');
-        await Workmanager().registerOneOffTask(
-          'drain-upload-queue',
-          'drain_uploads',
-          constraints: Constraints(
-            networkType: NetworkType.connected,
-            requiresBatteryNotLow: true,
-            requiresStorageNotLow: true,
-          ),
-          existingWorkPolicy: ExistingWorkPolicy.keep,
-          backoffPolicy: BackoffPolicy.exponential,
-          backoffPolicyDelay: const Duration(seconds: 30),
-          initialDelay: const Duration(seconds: 1),
-          inputData: {'reason': 'new_job_enqueued'},
-        );
-      } else {
-        _start();// foreground drain on non-Android (e.g., iOS)
-      }
+    // Schedule/keep a single "drain the queue" job on Android
+    if (Platform.isAndroid) {
+      debugPrint('WM[barcode_uploader]: registering drain_uploads (reason=new_job_enqueued)');
+      await Workmanager().registerOneOffTask(
+        'drain-upload-queue',
+        'drain_uploads',
+        constraints: Constraints(
+          networkType: NetworkType.connected,
+          requiresBatteryNotLow: true,
+          requiresStorageNotLow: true,
+        ),
+        existingWorkPolicy: ExistingWorkPolicy.keep,
+        backoffPolicy: BackoffPolicy.exponential,
+        backoffPolicyDelay: const Duration(seconds: 30),
+        initialDelay: const Duration(seconds: 1),
+        inputData: {'reason': 'new_job_enqueued'},
+      );
+    } else {
+      _start(); // foreground drain on non-Android (e.g., iOS)
+    }
+  } catch (e) {
+    // If enqueue fails before the job is persisted, release the in-flight key
+    _inflightKeys.remove(dupKey);
+    rethrow;
+  }
+}
 
+
+Future<void> _loadJobsFromDisk() async {
+  _jobs.clear();
+  if (_root == null) return;
+
+  // helper: does this job have all its queued JPGs?
+  Future<bool> _hasAllImages(UploadJob j) async {
+    if (j.imagePaths.isEmpty) return false;
+    for (final p in j.imagePaths) {
+      if (!await File(p).exists()) return false;
+    }
+    return true;
   }
 
-  Future<void> _loadJobsFromDisk() async {
-    _jobs.clear();
-    if (_root == null) return;
-    final dirs = _root!.listSync().whereType<Directory>();
-    for (final d in dirs) {
-      final f = File('${d.path}/job.json');
-      if (await f.exists()) {
-        try {
-          _jobs.add(UploadJob.fromJson(jsonDecode(await f.readAsString())));
-        } catch (_) {/* skip bad job */}
-      }
-    }
-    // after finishing the for-loop:
-    debugPrint('DEBUG3 loadJobsFromDisk: count=${_jobs.length}');
-    for (final j in _jobs) {
-      debugPrint('DEBUG3 job: id=${j.id} pod=${j.podNo} imgs=${j.imagePaths.length}');
-    }
+  // scan every job folder
+  final dirs = _root!.listSync().whereType<Directory>().toList();
 
+  // collect scan results as maps (no local class)
+  final scanned = <Map<String, dynamic>>[];
+  for (final d in dirs) {
+    final f = File('${d.path}/job.json');
+    if (!await f.exists()) continue;
+    try {
+      final j = UploadJob.fromJson(jsonDecode(await f.readAsString()));
+      final hasImg = await _hasAllImages(j);
+      final mt = (await f.stat()).modified; // mtime of job.json
+      scanned.add({
+        'job': j,
+        'dir': d,
+        'hasImg': hasImg,
+        'mtime': mt,
+      });
+    } catch (_) {
+      // skip bad/corrupt job.json
+    }
   }
+
+  // choose ONE job per (day|user|pod):
+  // 1) prefer one that has images
+  // 2) otherwise prefer the newer mtime
+  final Map<String, Map<String, dynamic>> bestByKey = {};
+  for (final s in scanned) {
+    final j = s['job'] as UploadJob;
+    final key = _jobKey(j); // username|YYYY-MM-DD|POD
+    final cur = bestByKey[key];
+    if (cur == null) {
+      bestByKey[key] = s;
+      continue;
+    }
+    final curHas = cur['hasImg'] as bool;
+    final sHas   = s['hasImg'] as bool;
+    if (curHas && !sHas) continue;                 // keep current (has image)
+    if (!curHas && sHas) { bestByKey[key] = s; continue; } // switch to one with image
+    final curMt = cur['mtime'] as DateTime;
+    final sMt   = s['mtime'] as DateTime;
+    if (sMt.isAfter(curMt)) bestByKey[key] = s;     // newer wins
+  }
+
+  // load chosen jobs into memory
+  _jobs.addAll(bestByKey.values.map((s) => s['job'] as UploadJob));
+
+  // optional cleanup: delete stray duplicate folders that DON'T have an image
+  final pickedPaths = <String>{
+    for (final s in bestByKey.values) (s['dir'] as Directory).path
+  };
+  for (final s in scanned) {
+    final dirPath = (s['dir'] as Directory).path;
+    final hasImg  = s['hasImg'] as bool;
+    if (!pickedPaths.contains(dirPath) && !hasImg) {
+      try { await Directory(dirPath).delete(recursive: true); } catch (_) {}
+    }
+  }
+
+  // debug
+  debugPrint('DEBUG3 loadJobsFromDisk: count=${_jobs.length}');
+  for (final j in _jobs) {
+    debugPrint('DEBUG3 job: id=${j.id} pod=${j.podNo} imgs=${j.imagePaths.length}');
+  }
+}
+
 
 /// Delete any queued *copies* for a given driver+POD (used after we see a manifest).
 Future<int> deleteQueueCopiesForPod({
@@ -584,6 +662,7 @@ Future<int> deleteQueueCopiesForPod({
       // Hard cap
       if (job.attempts >= kMaxAttempts) {
         _events.add(QueueEvent(job.id, job.podNo, false, const []));
+        _inflightKeys.remove(_jobKey(job));
         await _deleteJobFiles(job);          // drop the stuck job
         final idx = (_jobs.isNotEmpty && _jobs.first.id == job.id)
     ? 0
@@ -612,6 +691,7 @@ if (idx >= 0) _jobs.removeAt(idx);
 
       if (ok) {
         _events.add(QueueEvent(job.id, job.podNo, true, await _deriveUrls(job)));
+        _inflightKeys.remove(_jobKey(job));
         await _deleteJobFiles(job);
         final idx = (_jobs.isNotEmpty && _jobs.first.id == job.id)
     ? 0
@@ -625,6 +705,7 @@ if (idx >= 0) _jobs.removeAt(idx);
       if (permanent) {
         // stop retrying this job
         _events.add(QueueEvent(job.id, job.podNo, false, const []));
+        _inflightKeys.remove(_jobKey(job));
         await _deleteJobFiles(job);
         final idx = (_jobs.isNotEmpty && _jobs.first.id == job.id)
     ? 0
@@ -640,11 +721,12 @@ if (idx >= 0) _jobs.removeAt(idx);
       if (job.attempts >= kMaxAttempts) {
         _events.add(QueueEvent(job.id, job.podNo, false, const []));
         await _saveJob(job);
+        _inflightKeys.remove(_jobKey(job));   // <-- add this line
         await _deleteJobFiles(job);
         final idx = (_jobs.isNotEmpty && _jobs.first.id == job.id)
-    ? 0
-    : _jobs.indexWhere((x) => x.id == job.id);
-if (idx >= 0) _jobs.removeAt(idx);
+            ? 0
+            : _jobs.indexWhere((x) => x.id == job.id);
+        if (idx >= 0) _jobs.removeAt(idx);
 
         UploadNotifications.update(hasJobs: hasJobs, jobCount: jobCount);
         continue;
@@ -1085,9 +1167,12 @@ try {
 
   // (Optional but useful for future dedupe) include a stable job id
   notifyHeaders['x-job-id'] = j.id;  // uncomment if you also add server-side dedupe
-  notifyHeaders['x-notify-force'] = '1';
+  final content =
+    '📦 DO: ${j.podNo}\n${j.isRejected ? '❌ Rejected' : '✅ Delivered'}'
+    '\n🚚 $uLower\n📅 ${j.rddDate}';
+debugPrint('NOTIFY content =>\n$content');
 
-
+  
   final notifyResp = await http.post(
     Uri.parse(usedDeviceAuth ? '$kApiBase/notify_device' : '$kApiBase/notify'),
     headers: notifyHeaders,
@@ -3603,7 +3688,20 @@ void initState() {
   // Queue setup (unchanged)
   UploadQueue.instance.init();
   _queueSub = UploadQueue.instance.events.listen((e) async {
-    // ... your existing listener body ...
+    if (!mounted) return;
+
+    // Only react to successful uploads
+    if (e.success) {
+      try {
+        // Re-hydrate from S3 (this will cache-bust and fetch the latest manifest)
+        await _hydrateFromS3Manifests();
+
+        if (!mounted) return;
+        setState(() {}); // repaint with fresh status sets
+      } catch (_) {
+        // Ignore transient network errors; next hydrate trigger will catch up
+      }
+    }
   });
 
   // Run the rest async after the first frame
@@ -4076,7 +4174,13 @@ Future<void> openUploadPage(bool isRejected) async {
         '?v=${DateTime.now().millisecondsSinceEpoch}'
       );
       try {
-        final res = await http.get(uri);
+        final res = await http.get(
+          uri,
+          headers: const {
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache',
+          },
+        );
         if (res.statusCode == 200) {
           return jsonDecode(utf8.decode(res.bodyBytes)) as Map<String, dynamic>;
         }
@@ -4161,6 +4265,7 @@ Future<void> _hydrateFromS3Manifests() async {
     // IMPORTANT: merge (union) so we don't lose instant state from the listener
     uploadedPods = {...uploadedPods, ...nextUploaded};
     rejectedPods = {...rejectedPods, ...nextRejected};
+    uploadedPods.removeWhere((p) => rejectedPods.contains(p));
     ackedPods    = {...ackedPods,    ...nextAcked};
     podImages
       ..clear()
