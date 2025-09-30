@@ -16,7 +16,7 @@
 	<string>We save photos you take so they’re available in your photo library.</string>
 
 	<!-- Record video with sound (only if you capture video) -->
-
+	<key>NSMicrophoneUsageDescription</key>
 	<string>We need the microphone to record audio while capturing delivery videos.</string>
 
 	<key>CFBundleDevelopmentRegion</key>
@@ -63,7 +63,10 @@
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 	<!-- ADD this block inside the top-level <dict> ... </dict> -->
-	
+	<key>UIBackgroundModes</key>
+	<array>
+	<string>fetch</string>
+	</array>
 
 </dict>
 </plist>
