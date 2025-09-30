@@ -5,63 +5,53 @@ import UserNotifications
 @UIApplicationMain
 class AppDelegate: FlutterAppDelegate {
 
-  // Flutter method channel used by Dart side (IOSBgUpload.start)
-  static var bgChannel: FlutterMethodChannel?
-  // Stored completion handler for background URLSession relaunch
-  var bgCompletionHandler: (() -> Void)?
+  private var bgChannel: FlutterMethodChannel?
 
   // MARK: - App launch
+
   override func application(
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
   ) -> Bool {
+    let controller = window?.rootViewController as! FlutterViewController
 
-    // Register Flutter plugins first
-    GeneratedPluginRegistrant.register(with: self)
+    // MethodChannel for iOS background uploads
+    bgChannel = FlutterMethodChannel(
+      name: "bg_upload",
+      binaryMessenger: controller.binaryMessenger
+    )
 
-    // Create the single background uploader channel
-    if let controller = window?.rootViewController as? FlutterViewController {
-      let channel = FlutterMethodChannel(
-        name: "background_uploader",
-        binaryMessenger: controller.binaryMessenger
-      )
-      AppDelegate.bgChannel = channel
-
-      channel.setMethodCallHandler { call, result in
-        switch call.method {
-
-        case "start":
-          // Expecting: { filePath: String, presignedUrl: String, headers?: {..}, method?: "PUT"|"POST" }
-          guard
+    // Handle "start" calls from Dart (IOSBgUpload.start)
+    bgChannel?.setMethodCallHandler { [weak self] call, result in
+      guard call.method == "start",
             let args = call.arguments as? [String: Any],
-            let filePath   = args["filePath"] as? String,
-            let presigned  = args["presignedUrl"] as? String
-          else {
-            result(FlutterError(code: "bad_args", message: "filePath/presignedUrl missing", details: nil))
-            return
-          }
-          let headers = (args["headers"] as? [String: String]) ?? [:]
-          let method  = (args["method"]  as? String) ?? "PUT"
-
-          do {
-            try BackgroundUploader.shared.start(
-              filePath: filePath,
-              presignedUrl: presigned,
-              headers: headers,
-              method: method
-            )
-            result(true)
-          } catch {
-            result(FlutterError(code: "start_failed", message: error.localizedDescription, details: nil))
-          }
-
-        default:
-          result(FlutterMethodNotImplemented)
-        }
+            let filePath = args["filePath"] as? String,
+            let url = args["url"] as? String
+      else {
+        result(FlutterError(code: "bad_args", message: "Missing start args", details: nil))
+        return
       }
+      let method = (args["method"] as? String) ?? "PUT"
+      let headers = (args["headers"] as? [String:String]) ?? [:]
+
+      // Hook the uploader's notifier into Flutter
+      BackgroundUploader.shared.notify = { [weak self] payload in
+        self?.bgChannel?.invokeMethod("bg_upload_completed", arguments: payload)
+      }
+
+      BackgroundUploader.shared.startUpload(
+        filePath: filePath,
+        url: url,
+        method: method,
+        headers: headers
+      )
+      result(true)
     }
 
-    // Allow foreground notifications
+    // 1) Register all Flutter plugins (required for Workmanager, notifications, etc.)
+    GeneratedPluginRegistrant.register(with: self)
+
+    // 2) Let local notifications show when app is foregrounded
     if #available(iOS 10.0, *) {
       UNUserNotificationCenter.current().delegate = self
     }
@@ -69,125 +59,87 @@ class AppDelegate: FlutterAppDelegate {
     return super.application(application, didFinishLaunchingWithOptions: launchOptions)
   }
 
-  // MARK: - Background URLSession wake (required for background uploads)
+  // MARK: - Background URLSession wake
+
+  // iOS relaunches/wakes your app to deliver URLSession events for the background session.
   override func application(
     _ application: UIApplication,
     handleEventsForBackgroundURLSession identifier: String,
     completionHandler: @escaping () -> Void
   ) {
-    // Reconnect our background URLSession and keep handler to call when tasks finish
-    BackgroundUploader.shared.restore(identifier: identifier)
-    self.bgCompletionHandler = completionHandler
+    BackgroundUploader.shared.restore(identifier: identifier, completionHandler: completionHandler)
   }
-  
 }
 
-// MARK: - Embedded BackgroundUploader (no Xcode target edits needed)
+// MARK: - BackgroundUploader (embedded to avoid Xcode project edits)
 
 final class BackgroundUploader: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
 
   static let shared = BackgroundUploader()
 
-  // Use one well-known identifier everywhere
-  private let kBgSessionId = Bundle.main.bundleIdentifier! + ".bg.upload"
+  // Use a stable identifier; keep it unique to your app.
+  private let identifier = "com.yourco.hmepod.bg.upload"
 
-  private lazy var session: URLSession = {
-    let cfg = URLSessionConfiguration.background(withIdentifier: kBgSessionId)
-    cfg.isDiscretionary = false
-    cfg.sessionSendsLaunchEvents = true
-    // Be resilient on spotty networks:
-    if #available(iOS 11.0, *) {
-      cfg.waitsForConnectivity = true
-    }
-    cfg.allowsCellularAccess = true
-    if #available(iOS 13.0, *) {
-      cfg.allowsConstrainedNetworkAccess = true   // Low Data Mode OK
-      cfg.allowsExpensiveNetworkAccess = true     // 5G/LTE OK
-    }
-    return URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
-  }()
+  private var session: URLSession!
+  private var completionHandler: (() -> Void)?
 
-  /// Begin a background upload
-  func start(filePath: String, presignedUrl: String, headers: [String:String], method: String) throws {
+  /// Called by AppDelegate to send a completion payload to Dart.
+  var notify: (([String: Any]) -> Void)?
+
+  override init() {
+    super.init()
+    let config = URLSessionConfiguration.background(withIdentifier: identifier)
+    config.allowsCellularAccess = true
+    config.isDiscretionary = false
+    config.sessionSendsLaunchEvents = true
+    session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
+  }
+
+  /// Recreate the background session after iOS wakes your app and stash the OS completion handler.
+  func restore(identifier: String, completionHandler: @escaping () -> Void) {
+    let config = URLSessionConfiguration.background(withIdentifier: identifier)
+    config.allowsCellularAccess = true
+    config.isDiscretionary = false
+    config.sessionSendsLaunchEvents = true
+    session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
+    self.completionHandler = completionHandler
+  }
+
+  /// Start a background PUT upload.
+  func startUpload(filePath: String, url: String, method: String, headers: [String:String]) {
+    guard let u = URL(string: url) else { return }
     let fileURL = URL(fileURLWithPath: filePath)
-    guard FileManager.default.fileExists(atPath: fileURL.path) else {
-      throw NSError(domain: "BackgroundUploader", code: 1, userInfo: [NSLocalizedDescriptionKey: "file_not_found"])
-    }
-    guard let url = URL(string: presignedUrl) else {
-      throw NSError(domain: "BackgroundUploader", code: 2, userInfo: [NSLocalizedDescriptionKey: "bad_url"])
-    }
 
-    var req = URLRequest(url: url)
+    var req = URLRequest(url: u)
     req.httpMethod = method
-    headers.forEach { req.setValue($0.value, forHTTPHeaderField: $0.key) }
+    for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
 
     let task = session.uploadTask(with: req, fromFile: fileURL)
-
-    // stash minimal metadata so we can echo back to Dart on completion
-    let meta: [String: Any] = ["filePath": filePath, "url": presignedUrl]
-    if let data = try? JSONSerialization.data(withJSONObject: meta),
-       let s = String(data: data, encoding: .utf8) {
-      task.taskDescription = s
-    }
-
+    task.taskDescription = filePath // so we can report which file completed
     task.resume()
   }
 
-  /// Recreate the session when iOS relaunches us for background events
-  func restore(identifier: String) {
-    guard identifier == kBgSessionId else { return }
-    let cfg = URLSessionConfiguration.background(withIdentifier: kBgSessionId)
-    cfg.isDiscretionary = false
-    cfg.sessionSendsLaunchEvents = true
-    if #available(iOS 11.0, *) { cfg.waitsForConnectivity = true }
-    cfg.allowsCellularAccess = true
-    if #available(iOS 13.0, *) {
-      cfg.allowsConstrainedNetworkAccess = true
-      cfg.allowsExpensiveNetworkAccess = true
-    }
-    self.session = URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
-  }
-
-  // MARK: - URLSessionTaskDelegate
+  // MARK: URLSessionTaskDelegate
 
   func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-    let status = (task.response as? HTTPURLResponse)?.statusCode ?? -1
-    let ok = (200...299).contains(status) && (error == nil)
-
-    var meta: [String: Any] = [:]
-    if let s = task.taskDescription,
-       let data = s.data(using: .utf8),
-       let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-      meta = obj
-    }
-
-    if let e = error {
-      NSLog("bg upload error: \(e.localizedDescription), status=\(status), task=\(task.taskIdentifier)")
-    } else {
-      NSLog("bg upload completed, status=\(status), task=\(task.taskIdentifier)")
-    }
-
-    var payload: [String: Any] = [
+    let status = (task.response as? HTTPURLResponse)?.statusCode ?? 0
+    let ok = (error == nil) && (200...299).contains(status)
+    let payload: [String: Any] = [
       "ok": ok,
       "status": status,
-      "taskId": task.taskIdentifier
+      "taskId": task.taskIdentifier,
+      "filePath": task.taskDescription ?? "",
+      "url": task.originalRequest?.url?.absoluteString ?? "",
+      "error": error?.localizedDescription as Any
     ]
-    meta.forEach { payload[$0.key] = $1 }
-    if let e = error { payload["error"] = e.localizedDescription }
-
-    DispatchQueue.main.async {
-      AppDelegate.bgChannel?.invokeMethod("bg_upload_completed", arguments: payload)
-    }
+    notify?(payload)
   }
 
-  // Called when iOS has delivered all pending events for our background session
+  /// Called when all events for the background session have been delivered by iOS.
   func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
-    DispatchQueue.main.async {
-      if let app = UIApplication.shared.delegate as? AppDelegate,
-         let handler = app.bgCompletionHandler {
-        app.bgCompletionHandler = nil
-        handler()
-      }
+    DispatchQueue.main.async { [weak self] in
+      self?.completionHandler?()
+      self?.completionHandler = nil
     }
   }
 }
