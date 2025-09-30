@@ -10,51 +10,62 @@ class AppDelegate: FlutterAppDelegate {
 
   // MARK: - App launch
 
-  override func application(
-    _ application: UIApplication,
-    didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
-  ) -> Bool {
-    let controller = window?.rootViewController as! FlutterViewController
+override func application(
+  _ application: UIApplication,
+  didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
+) -> Bool {
+  let controller = window?.rootViewController as! FlutterViewController
 
-    // MethodChannel for iOS background uploads
-    AppDelegate.bgChannel = FlutterMethodChannel(
-      name: "bg_upload",
-      binaryMessenger: controller.binaryMessenger
-    )
+  // Register plugins first
+  GeneratedPluginRegistrant.register(with: self)
 
-    // Handle "start" calls from Dart (IOSBgUpload.start)
-    bgChannel?.setMethodCallHandler { [weak self] call, result in
-      guard call.method == "start",
-            let args = call.arguments as? [String: Any],
-            let filePath = args["filePath"] as? String,
-            let url = args["url"] as? String
+  // Single channel used by Dart
+  let channel = FlutterMethodChannel(
+    name: "background_uploader",
+    binaryMessenger: controller.binaryMessenger
+  )
+  AppDelegate.bgChannel = channel
+
+  channel.setMethodCallHandler { call, result in
+    switch call.method {
+    case "start":
+      guard
+        let args = call.arguments as? [String: Any],
+        let filePath  = args["filePath"] as? String,
+        let presignedUrl = args["presignedUrl"] as? String
       else {
-        result(FlutterError(code: "bad_args", message: "Missing start args", details: nil))
+        result(FlutterError(code: "bad_args", message: "filePath/presignedUrl missing", details: nil))
         return
       }
-      let method = (args["method"] as? String) ?? "PUT"
-      let headers = (args["headers"] as? [String:String]) ?? [:]
+      let headers = args["headers"] as? [String: String] ?? [:]
+      let method  = (args["method"] as? String) ?? "PUT"
 
-    BackgroundUploader.shared.start(
-      filePath: filePath,
-      url: url,
-      method: method,
-      headers: headers
-    )
-
+      do {
+        try BackgroundUploader.shared.start(
+          filePath: filePath,
+          presignedUrl: presignedUrl,
+          headers: headers,
+          method: method
+        )
       result(true)
+      } catch {
+        result(FlutterError(code: "bg_start_failed", message: error.localizedDescription, details: nil))
+      }
+
+    default:
+      result(FlutterMethodNotImplemented)
     }
-
-    // 1) Register all Flutter plugins (required for Workmanager, notifications, etc.)
-    GeneratedPluginRegistrant.register(with: self)
-
-    // 2) Let local notifications show when app is foregrounded
-    if #available(iOS 10.0, *) {
-      UNUserNotificationCenter.current().delegate = self
-    }
-
-    return super.application(application, didFinishLaunchingWithOptions: launchOptions)
   }
+
+  // Foreground notifications
+  if #available(iOS 10.0, *) {
+    UNUserNotificationCenter.current().delegate = self
+  }
+
+  return super.application(application, didFinishLaunchingWithOptions: launchOptions)
+}
+
+  
 
   // MARK: - Background URLSession wake
 
