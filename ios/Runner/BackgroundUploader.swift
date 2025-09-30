@@ -8,19 +8,27 @@ final class BackgroundUploader: NSObject, URLSessionDelegate, URLSessionTaskDele
         let cfg = URLSessionConfiguration.background(withIdentifier: Bundle.main.bundleIdentifier! + ".bg.upload")
         cfg.isDiscretionary = false
         cfg.sessionSendsLaunchEvents = true
-        cfg.allowsCellularAccess = true
-        if #available(iOS 13.0, *) {
-            cfg.allowsConstrainedNetworkAccess = true
+        cfg.waitsForConnectivity = true              // <— add this
+        cfg.allowsCellularAccess = true              // <— keep true so it can use mobile data
+        cfg.allowsExpensiveNetworkAccess = true      // <— ok for 5G/LTE
+        cfg.allowsConstrainedNetworkAccess = true    // <— ok for Low Data Mode
+        if #available(iOS 11.0, *) {
+            cfg.waitsForConnectivity = true
         }
+        if #available(iOS 13.0, *) {
+            cfg.allowsConstrainedNetworkAccess = true   // Low Data Mode OK
+            cfg.allowsExpensiveNetworkAccess = true     // 5G/Cellular OK
+        }
+
         return URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
     }()
 
-    func start(filePath: String, url: String, method: String, headers: [String:String]) throws {
+    func start(filePath: String, presignedUrl: String, headers: [String:String], method: String) throws {
         let fileUrl = URL(fileURLWithPath: filePath)
         guard FileManager.default.fileExists(atPath: fileUrl.path) else {
             throw NSError(domain: "BackgroundUploader", code: 1, userInfo: [NSLocalizedDescriptionKey: "file_not_found"])
         }
-        guard let reqUrl = URL(string: url) else {
+        guard let reqUrl = URL(string: presignedUrl) else {
             throw NSError(domain: "BackgroundUploader", code: 2, userInfo: [NSLocalizedDescriptionKey: "bad_url"])
         }
         var req = URLRequest(url: reqUrl)
@@ -40,6 +48,27 @@ final class BackgroundUploader: NSObject, URLSessionDelegate, URLSessionTaskDele
 
         task.resume()
     }
+
+    func restore(identifier: String) {
+        // Only recreate if the identifier matches ours
+        let myId = Bundle.main.bundleIdentifier! + ".bg.upload"
+        guard identifier == myId else { return }
+
+        let cfg = URLSessionConfiguration.background(withIdentifier: Bundle.main.bundleIdentifier! + ".bg.upload")
+        cfg.isDiscretionary = false
+        cfg.sessionSendsLaunchEvents = true
+        cfg.allowsCellularAccess = true
+        if #available(iOS 11.0, *) {
+            cfg.waitsForConnectivity = true
+        }
+        if #available(iOS 13.0, *) {
+            cfg.allowsConstrainedNetworkAccess = true
+            cfg.allowsExpensiveNetworkAccess = true
+        }
+        // Rebind the delegate so we receive completion callbacks.
+        self.session = URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
+    }
+
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         let http = task.response as? HTTPURLResponse
@@ -75,15 +104,15 @@ final class BackgroundUploader: NSObject, URLSessionDelegate, URLSessionTaskDele
     }
 
     func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
-    // Called when the system has delivered all pending background events for this URLSession.
-    DispatchQueue.main.async {
-        if let app = UIApplication.shared.delegate as? AppDelegate,
-           let handler = app.bgCompletionHandler {
-            app.bgCompletionHandler = nil
-            handler()
+        DispatchQueue.main.async {
+            if let app = UIApplication.shared.delegate as? AppDelegate,
+            let handler = app.bgCompletionHandler {
+                app.bgCompletionHandler = nil
+                handler()
+            }
         }
     }
-}
+
 
 
 }
