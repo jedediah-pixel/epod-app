@@ -43,7 +43,7 @@ override func application(
       do {
         try BackgroundUploader.shared.start(
           filePath: filePath,
-          presignedUrl: presignedUrl,
+          url: presignedUrl, 
           headers: headers,
           method: method
         )
