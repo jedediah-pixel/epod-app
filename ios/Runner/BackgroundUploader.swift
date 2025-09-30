@@ -31,9 +31,10 @@ final class BackgroundUploader: NSObject, URLSessionDelegate, URLSessionTaskDele
         let meta: [String: Any] = [
             "filePath": filePath,
             "url": url
+            "retry": 0
             // add more fields here if you want to show in Discord (e.g., "podNo": podNo)
         ]
-        if let data = try? JSONSerialization.data(withJSONObject: meta, options: []),
+        if let data = try? JSONSerialization.data(withJSONObject: meta),
         let s = String(data: data, encoding: .utf8) {
             task.taskDescription = s
         }
@@ -59,6 +60,33 @@ final class BackgroundUploader: NSObject, URLSessionDelegate, URLSessionTaskDele
         } else {
             NSLog("bg upload completed, status=\(status), task=\(task.taskIdentifier)")
         }
+
+        // --- auto-retry on transient failures (up to 2 tries) ---
+let filePath = (meta["filePath"] as? String) ?? ""
+let urlStr   = (meta["url"] as? String) ?? ""
+let retry    = (meta["retry"] as? Int) ?? 0
+
+let shouldRetry = (!ok) && (
+  status == -1 ||                   // no response / transport error
+  status == 408 || status == 429 || // timeout / rate-limited
+  (500...599).contains(status)      // server errors
+)
+
+if shouldRetry && retry < 2 {
+  guard !filePath.isEmpty, let u = URL(string: urlStr) else { return }
+  var req = task.originalRequest ?? URLRequest(url: u)
+  let newTask = session.uploadTask(with: req, fromFile: URL(fileURLWithPath: filePath))
+
+  var nextMeta = meta; nextMeta["retry"] = retry + 1
+  if let data = try? JSONSerialization.data(withJSONObject: nextMeta),
+     let s = String(data: data, encoding: .utf8) {
+    newTask.taskDescription = s
+  }
+  newTask.resume()
+  return
+}
+// --- end auto-retry block ---
+
 
         // Send a callback to Dart so you can run the same Discord notify format there.
         var payload: [String: Any] = [
